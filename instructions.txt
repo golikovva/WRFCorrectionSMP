@@ -1,0 +1,11 @@
+salloc -p gpu --gres=gpu:1 --cpus-per-task=4 --mem=20000 --time=01:00:00
+
+srun -p gpu --gres=gpu:1 --cpus-per-task=4 --mem=20000 --time=01:00:00 --pty apptainer exec --nv \
+  --bind /storage/thalassa/users/vgolikov/stations:/home/stations \
+  --bind /storage/thalassa/users/vgolikov/borey_scatter:/home/scatter \
+  --bind $(pwd):/home \
+  --bind /storage/thalassa/users/vgolikov/logs:/home/logs \
+  --bind /storage/thalassa/SMP/WRF_OUTPUT/v2:/home/wrf_smp_data \
+  --bind /storage/thalassa/DATA/ERA5:/home/era_global_data \
+  /storage/thalassa/users/vgolikov/wrf_correction_smp.sif \
+  /bin/bash

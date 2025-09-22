@@ -1,0 +1,102 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
+
+%environment
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=UTC
+    export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6+PTX"
+    export TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
+    export CMAKE_PREFIX_PATH="$(dirname $(which conda))/../"
+    export USE_CUDA=1
+    export USE_CUDNN=1
+    export NAME=vgolikovwrf
+
+%post
+    # Set non-interactive mode and timezone BEFORE apt-get
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=UTC
+    
+    # This prevents tzdata from prompting
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+    # Update and install system dependencies
+    apt-get update && apt-get install -y \
+        git \
+        build-essential \
+        cmake \
+        ninja-build \
+        wget \
+        curl \
+        libopenmpi-dev \
+        libomp-dev \
+        tzdata \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Upgrade pip
+    pip install --no-cache-dir --upgrade pip
+
+    # Install Python packages
+    pip install --no-cache-dir \
+        scikit-learn \
+        pandas \
+        netCDF4 \
+        matplotlib \
+        pendulum \
+        scipy \
+        optuna \
+        jupyter \
+        jupyterlab \
+        notebook \
+        addict \
+        pytorch-msssim \
+        einops \
+        timm
+
+    pip install --no-cache-dir \
+        transformers==4.35.0
+
+    # Install packages with conda
+    conda install -c conda-forge -c anaconda -y \
+        wrf-python \
+        basemap \
+        cartopy \
+        && conda clean -afy
+
+    # Install PyTorch compilation dependencies
+    pip install --no-cache-dir \
+        torchviz \
+        torchinfo \
+        fvcore \
+        iopath
+
+    # Install KNN_CUDA
+    pip install --no-cache-dir \
+        https://github.com/unlimblue/KNN_CUDA/releases/download/0.2/KNN_CUDA-0.2-py3-none-any.whl
+
+    # Install PointNet2 ops
+    pip install --no-cache-dir \
+        "git+https://github.com/erikwijmans/Pointnet2_PyTorch.git#egg=pointnet2_ops&subdirectory=pointnet2_ops_lib"
+
+    # Install additional compilation tools
+    pip install --no-cache-dir \
+        ninja \
+        cython
+
+    # Create directories
+    mkdir -p /home/experiments/train_test
+
+
+%files
+    # Copy source code into container
+    . /home
+
+%runscript
+    echo "Container for WRF correction experiments is ready."
+    exec "$@"
+
+%startscript
+    echo "Starting container..."
+
+%labels
+    Author v.golikov
+    Version 1.0
