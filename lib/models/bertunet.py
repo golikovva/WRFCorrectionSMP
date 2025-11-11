@@ -7,37 +7,38 @@ from torch.nn.utils.rnn import PackedSequence, pad_packed_sequence, pack_padded_
 
 from lib.models.unet_parts import DoubleConv, Down, Up, OutConv
 
-class UNet(nn.Module):
-    def __init__(self, n_channels, n_classes, bilinear=True, h=210, w=280):
-        super(UNet, self).__init__()
+class BERTUNet(nn.Module):
+    def __init__(self, n_channels, n_classes, bilinear=True, h=210, w=280, chan_factor=2):
+        super(BERTUNet, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         print('Model:', n_channels, '->', n_classes)
 
         self.unet_mode = 'train'  # Режим для U-net
         self.transformer_mode = 'train'  # Режим для трансформера
-        chan_factor = 2
-        factor = 2 if bilinear else 1
+        self.chan_factor = chan_factor
+        self.factor = 2 if bilinear else 1
         self.h = h
         self.w = w
-        self.patch_encoding = nn.Embedding((self.h // 16) * (self.w // 16), 512 // 2)
-        self.pos_encoding = nn.Embedding(10, 512 // 2)
-
+        self.latent_dim = 1024 // self.chan_factor // self.factor
+        self.patch_encoding = nn.Embedding((self.h // 16) * (self.w // 16), self.latent_dim)
+        self.pos_encoding = nn.Embedding(10, self.latent_dim)
+        
         self.causal_bro = BertEncoder(BertConfig(
-            hidden_size=512 // 2,
+            hidden_size=self.latent_dim,
             num_hidden_layers=4,
             num_attention_heads=4,
-            intermediate_size=512 * 4 // 2
+            intermediate_size=self.latent_dim * 4
         ))
 
         self.inc = (DoubleConv(n_channels, 64 // chan_factor))
         self.down1 = (Down(64 // chan_factor, 128 // chan_factor))
         self.down2 = (Down(128 // chan_factor, 256 // chan_factor))
         self.down3 = (Down(256 // chan_factor, 512 // chan_factor))
-        self.down4 = (Down(512 // chan_factor, 1024 // chan_factor // factor))
-        self.up1 = (Up(1024 // chan_factor, 512 // chan_factor // factor, bilinear))
-        self.up2 = (Up(512 // chan_factor, 256 // chan_factor // factor, bilinear))
-        self.up3 = (Up(256 // chan_factor, 128 // chan_factor // factor, bilinear))
+        self.down4 = (Down(512 // chan_factor, 1024 // chan_factor // self.factor))
+        self.up1 = (Up(1024 // chan_factor, 512 // chan_factor // self.factor, bilinear))
+        self.up2 = (Up(512 // chan_factor, 256 // chan_factor // self.factor, bilinear))
+        self.up3 = (Up(256 // chan_factor, 128 // chan_factor // self.factor, bilinear))
         self.up4 = (Up(128 // chan_factor, 64 // chan_factor))
         self.outc = (OutConv(64 // chan_factor, n_classes))
 
@@ -49,15 +50,17 @@ class UNet(nn.Module):
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
-        x5 = x5.view(orig_shape[0], orig_shape[1], 512 // 2, (self.h // 16) * (self.w // 16))
+
+        x5 = x5.view(orig_shape[0], orig_shape[1], self.latent_dim, (self.h // 16) * (self.w // 16))
 
         x5 = x5.permute(1, 0, 3, 2)
+
         x5_patch = self.patch_encoding(torch.arange(0, x5.shape[2], device=x5.device))
         x5_pos = self.pos_encoding(torch.arange(0, x5.shape[1], device=x5.device))
-        x5 = x5 + x5_patch.view(1, 1, (self.h // 16) * (self.w // 16), 512 // 2) + x5_pos.view(1, orig_shape[0], 1, 512 // 2)
-        x5 = x5.reshape(x5.shape[0], -1, 512 // 2)
+        x5 = x5 + x5_patch.view(1, 1, (self.h // 16) * (self.w // 16), self.latent_dim) + x5_pos.view(1, orig_shape[0], 1, self.latent_dim)
+        x5 = x5.reshape(x5.shape[0], -1, self.latent_dim)
         x5 = self.causal_bro(x5).last_hidden_state
-        x5 = x5.reshape(x5.shape[0] * orig_shape[0], (self.h // 16), (self.w // 16), 512 // 2)
+        x5 = x5.reshape(x5.shape[0] * orig_shape[0], (self.h // 16), (self.w // 16), self.latent_dim)
         x5 = x5.permute(0, 3, 1, 2)
 
         x = self.up1(x5, x4)
