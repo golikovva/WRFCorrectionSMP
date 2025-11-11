@@ -1,0 +1,73 @@
+data:
+  start_date: '2015-01-01'
+  end_date: '2018-12-31'
+  wrf_folder: '/home/wrf_smp_data/'
+  era_folder: '/home/era_data/'
+  gfs_folder: '/home/gfs_data/'
+  scatter_folder: '/home/scatter/'
+  stations_folder: '/home/stations/borey/interp/'
+  wrf_mean_path: "/home/metadata/means_dict"
+  wrf_std_path: "/home/metadata/stds_dict"
+  base_folder: '/home'
+  logs_folder: "/home/logs/"
+  wrf_variables: ['uvmet10', 'T2', 'SEAICE', 'HGT']
+  era_variables: ['u10', 'v10', 't2m']
+  gfs_variables: ['UGRD_10maboveground', 'VGRD_10maboveground', 'TMP_2maboveground']
+
+s2s:
+  sequence_len: 4
+
+train:
+  max_epochs: 10
+  scheduler_type: MultiStepLR
+  lr: 0.0001
+
+model_type: BERTunet
+model_args:
+  BERTunet:
+    n_channels: 9
+    n_classes: 3
+    bilinear: True
+    h: 412
+    w: 1050
+  DETrajGRU:
+    encoder_cahnnels: 2
+  VSBERTunet:
+    n_channels: 4
+    n_classes: 3
+    max_len: 24
+    chan_factor: 2
+    bilinear: True
+  ConvNext:
+    n_channels: 9
+    n_classes: 3
+
+betas:
+  beta_era: 1
+  beta_ms: 10
+  beta_st: 1
+  beta_sc: 1
+
+run_config:
+  run_mode: 'train'
+  num_workers: 16
+  batch_size: 4
+  use_spatial_encoding: 1
+  use_time_encoding: 1
+  use_landmask: 0
+  weighted_meaner: 1
+  variable_sequence_length: 0
+  use_stations: True
+  use_scatter: True
+
+loss_config:
+  loss_kernel: 'gauss'
+  k: 9
+
+test_config:
+  best_epoch_id: 7
+  run_id: 1
+  draw_plots: 1
+  save_losses: 0
+  save_outputs: 0
+

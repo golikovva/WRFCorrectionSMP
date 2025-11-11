@@ -1,8 +1,9 @@
 data:
-  start_date: '2019-01-01'
-  end_date: '2020-12-31'
+  start_date: '2015-01-15'
+  end_date: '2018-12-31'
   wrf_folder: '/home/wrf_smp_data/'
-  era_folder: '/home/era_global_data/'
+  era_folder: '/home/era_data/'
+  gfs_folder: '/home/gfs_data/'
   scatter_folder: '/home/scatter/'
   stations_folder: '/home/stations/borey/interp/'
   wrf_mean_path: "/home/metadata/means_dict"
@@ -11,23 +12,28 @@ data:
   logs_folder: "/home/logs/"
   wrf_variables: ['uvmet10', 'T2', 'SEAICE', 'HGT']
   era_variables: ['u10', 'v10', 't2m']
+  gfs_variables: ['UGRD_10maboveground', 'VGRD_10maboveground', 'TMP_2maboveground']
+
+reference_dataset: GFS
+target_dataset: ERA5
 
 s2s:
-  sequence_len: 4
+  sequence_len: 2
 
 train:
-  max_epochs: 10
+  max_epochs: 40
   scheduler_type: MultiStepLR
   lr: 0.0001
 
 model_type: BERTunet
 model_args:
   BERTunet:
-    n_channels: 9
+    n_channels: 7
     n_classes: 3
     bilinear: True
-    h: 412
-    w: 1050
+    h: 721 #412
+    w: 1440 #1050
+    chan_factor: 1
   DETrajGRU:
     encoder_cahnnels: 2
   VSBERTunet:
@@ -42,27 +48,29 @@ model_args:
 
 betas:
   beta_era: 1
-  beta_ms: 10
-  beta_st: 1
-  beta_sc: 1
+  beta_ms: 0
+  beta_st: 0
+  beta_sc: 0
 
 run_config:
-  run_mode: 'test'
-  num_workers: 16
-  batch_size: 4
+  run_mode: 'train'
+  num_workers: 8
+  batch_size: 1
   use_spatial_encoding: 1
   use_time_encoding: 1
   use_landmask: 0
-  weighted_meaner: 1
+  weighted_meaner: 0
   variable_sequence_length: 0
+  use_stations: False
+  use_scatter: False
 
 loss_config:
   loss_kernel: 'gauss'
   k: 9
 
 test_config:
-  best_epoch_id: 7
-  run_id: 1
+  best_epoch_id: 14
+  run_id: 2
   draw_plots: 1
   save_losses: 0
   save_outputs: 0
