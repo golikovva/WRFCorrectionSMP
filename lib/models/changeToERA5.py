@@ -39,7 +39,6 @@ class ClusterMapper(nn.Module):
     def target_slice(self):
         if self._target_slice is None:
             self._target_slice = self.mapping.unique().long().cpu()
-        print(self._target_slice.device)
         return self._target_slice
 
     def set_mapping_by_file(self, mapping_file):

@@ -5,6 +5,7 @@ from einops import rearrange
 from torch.nn import functional as F
 import numpy.random as random
 from timm.layers import trunc_normal_, DropPath
+from lib.models.vit_latent import LatentViT
 
 class LayerNorm(nn.Module):
     """ LayerNorm that supports two data formats: channels_last (default) or channels_first. 
@@ -88,7 +89,7 @@ class ConvNeXtV2(nn.Module):
         drop_path_rate (float): Stochastic depth rate. Default: 0.
         head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
     """
-    def __init__(self, in_chans=3,  out_channel = 3,
+    def __init__(self, in_chans=3,  out_channel=3,
                  depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], 
                  drop_path_rate=0., head_init_scale=1.
                  ):
@@ -147,11 +148,9 @@ class ConvNeXtV2(nn.Module):
         return x, down_features
 
     def Decoder(self, x, down_features):
-        [print(f.shape, 'fi') for f in down_features]
+        # [print(f.shape, 'fi') for f in down_features]
         for i in range(self.num_stage):
-            print(x.shape, 'x')
-            df =  down_features.pop()
-            print(x.shape, 'vs', df.shape, 'or', pad(x, df).shape)
+            df = down_features.pop()
             x = torch.cat([pad(x, df), df], dim=1)
             x = self.upsample_layers[i](x)
         return x
@@ -171,6 +170,176 @@ def pad(x1, x2):
     x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
                     diffY // 2, diffY - diffY // 2], mode='reflect')
     return x1
+
+
+class ConvNeXtV2LatentVit(ConvNeXtV2):
+    """
+    ConvNeXtV2 U-Net-like model with a RoPE ViT operating in latent space.
+
+    Input:
+        batch_first=True  -> (B, T, C, H, W)
+        batch_first=False -> (T, B, C, H, W)
+
+    Output:
+        same temporal layout as input, with channel dim = out_channel
+    """
+    def __init__(
+        self,
+        in_chans: int = 3,
+        out_channel: int = 3,
+        depths=(3, 3, 9, 3),
+        dims=(96, 192, 384, 768),
+        drop_path_rate: float = 0.0,
+        head_init_scale: float = 1.0,
+        *,
+        batch_first: bool = True,
+        max_T: int = 10,
+        vit_depth: int = 4,
+        vit_heads: int = 4,
+        vit_mlp_ratio: float = 4.0,
+        vit_drop: float = 0.0,
+        vit_attn_drop: float = 0.0,
+        vit_drop_path: float = 0.0,
+        vit_rope_theta: float = 100.0,
+        vit_rope_mode: str = "mixed",
+    ):
+        super().__init__(
+            in_chans=in_chans,
+            out_channel=out_channel,
+            depths=list(depths),
+            dims=list(dims),
+            drop_path_rate=drop_path_rate,
+            head_init_scale=head_init_scale,
+        )
+
+        self.in_chans = in_chans
+        self.out_channel = out_channel
+        self.batch_first = batch_first
+
+        self.unet_mode = "train"
+        self.transformer_mode = "train"
+
+        # bottleneck channel count after ConvNeXtV2 encoder
+        self.latent_dim = dims[-1]
+
+        if self.latent_dim % vit_heads != 0:
+            raise ValueError(
+                f"latent_dim={self.latent_dim} must be divisible by vit_heads={vit_heads}"
+            )
+
+        head_dim = self.latent_dim // vit_heads
+        if head_dim % 4 != 0:
+            raise ValueError(
+                f"LatentViT SpatialRoPE requires head_dim % 4 == 0, "
+                f"but got head_dim={head_dim} (latent_dim={self.latent_dim}, vit_heads={vit_heads})"
+            )
+
+        self.latent_vit = LatentViT(
+            dim=self.latent_dim,
+            depth=vit_depth,
+            num_heads=vit_heads,
+            max_T=max_T,
+            mlp_ratio=vit_mlp_ratio,
+            drop=vit_drop,
+            attn_drop=vit_attn_drop,
+            drop_path=vit_drop_path,
+            rope_theta=vit_rope_theta,
+            rope_mode=vit_rope_mode,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x:
+            if batch_first=True:  (B, T, Cin, H, W)
+            if batch_first=False: (T, B, Cin, H, W)
+
+        returns:
+            same temporal layout, shape (..., Cout, H_out, W_out)
+        """
+        if not self.batch_first:
+            x = x.permute(1, 0, 2, 3, 4).contiguous()
+
+        if x.ndim != 5:
+            raise ValueError(f"Expected 5D input, got shape {tuple(x.shape)}")
+
+        B, T, Cin, H, W = x.shape
+        if Cin != self.in_chans:
+            raise ValueError(f"Expected Cin={self.in_chans}, got {Cin}")
+
+        # apply ConvNeXt encoder independently to each time slice
+        x_2d = x.reshape(B * T, Cin, H, W)
+
+        # x_latent: (B*T, C_lat, h_lat, w_lat)
+        # down_features: list of skip tensors, each (B*T, C_i, h_i, w_i)
+        x_latent, down_features = self.Encoder(x_2d)
+
+        C_lat, h_lat, w_lat = x_latent.shape[1:]
+        if C_lat != self.latent_dim:
+            raise RuntimeError(
+                f"Latent channel mismatch: got {C_lat}, expected {self.latent_dim}"
+            )
+
+        # temporal latent transformer
+        x_latent = x_latent.reshape(B, T, C_lat, h_lat, w_lat)
+        x_latent = self.latent_vit(x_latent)
+        x_latent = x_latent.reshape(B * T, C_lat, h_lat, w_lat)
+
+        # decode framewise using stored spatial skips
+        # copy the list because Decoder pops from it
+        x_dec = self.Decoder(x_latent, down_features.copy())
+        logits = self.out_conv(x_dec)
+
+        H_out, W_out = logits.shape[-2:]
+        logits = logits.reshape(B, T, self.out_channel, H_out, W_out)
+
+        if not self.batch_first:
+            logits = logits.permute(1, 0, 2, 3, 4).contiguous()
+
+        return logits
+
+    def freeze_backbone(self):
+        """
+        Freeze ConvNeXt encoder/decoder and keep latent transformer trainable.
+        """
+        for name, param in self.named_parameters():
+            if not name.startswith("latent_vit"):
+                param.requires_grad = False
+        print("ConvNeXtV2 backbone frozen. latent_vit remains trainable.")
+
+    def set_mode(self, unet_mode: str = "eval", transformer_mode: str = "train"):
+        """
+        Set separate train/eval modes for ConvNeXtV2 part and latent transformer.
+        """
+        self.unet_mode = unet_mode
+        self.transformer_mode = transformer_mode
+
+        for name, module in self.named_modules():
+            if name == "":
+                continue
+            if name.startswith("latent_vit"):
+                module.train() if transformer_mode == "train" else module.eval()
+            else:
+                module.train() if unet_mode == "train" else module.eval()
+
+        print(
+            f"ConvNeXtV2 backbone set to {unet_mode}. "
+            f"Latent transformer set to {transformer_mode}."
+        )
+
+    def train(self, mode: bool = True):
+        """
+        Preserve global train(mode) behavior, while allowing separate backbone/transformer modes.
+        """
+        for name, module in self.named_modules():
+            if name == "":
+                module.training = mode
+                continue
+            if name.startswith("latent_vit"):
+                module.train(self.transformer_mode == "train" and mode)
+            else:
+                module.train(self.unet_mode == "train" and mode)
+        return self
+    
 
 if __name__ == "__main__":
     # model = ConvNeXtV2(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024])

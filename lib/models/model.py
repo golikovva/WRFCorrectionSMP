@@ -20,6 +20,8 @@ class Corrector(nn.Module):
             return torch.nn.utils.rnn.PackedSequence(res, x_orig.batch_sizes, x_orig.sorted_indices, x_orig.unsorted_indices)
         else:
             o_input = torch.split(x_orig, 3, dim=-3)
+            # print(unet_out.shape, 'out shape')
+            # print(o_input[0].shape)
             return o_input[0] + unet_out.view(x.shape[0], x.shape[1], 3, x.shape[3], x.shape[4])
 
 
