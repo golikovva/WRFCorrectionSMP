@@ -122,8 +122,15 @@ def variable_len_collate(batch):
         Collated batch data, which can be None, a list of datetime64 objects, a packed sequence of tensors,
         or a default collated batch depending on the input batch type.
     """
+    is_list = False
+    if isinstance(batch[0], (list, tuple, set)):
+        is_list = True
+        total_elems = len(batch[0])
+
     batch = [b for b in batch if not _contains_none(b)]
     if len(batch) == 0:
+        if is_list:
+            return [None]*total_elems
         return None  # training loop should skip this batch
 
     elem = batch[0]
