@@ -1,11 +1,10 @@
 data:
-  start_date: '2015-01-01'
-  end_date: '2018-12-31'
-  wrf_folder: '/home/wrf_smp_data/'
+  nestp_folder: '/home/wrf_nestp/'
+  borey_folder: '/home/wrf_borey/'
   era_folder: '/home/era_data/'
   gfs_folder: '/home/gfs_data/'
   scatter_folder: '/home/scatter/'
-  stations_folder: '/home/stations/borey/interp/'
+  stations_folder: '/home/stations/'
   wrf_mean_path: "/home/metadata/means_dict"
   wrf_std_path: "/home/metadata/stds_dict"
   base_folder: '/home'
@@ -14,22 +13,45 @@ data:
   era_variables: ['u10', 'v10', 't2m']
   gfs_variables: ['UGRD_10maboveground', 'VGRD_10maboveground', 'TMP_2maboveground']
 
+stations_ds:
+  wind_variables: ['WSPD10']
+  wind_format: 'w'
+
+split_config:
+  start_date: '2019-01-01'
+  end_date: '2020-12-31'
+  split_mode: 'percents'
+  train_size: 0.45
+  validation_size: 0.05
+  test_size: 0.5
+  time_step: '1h'
+  train_end: ~
+  validation_end: ~
+  valid_years: '2019'
+  test_years: '2020'
+
+reference_dataset: WRF
+target_dataset: ERA5
+reference_region: borey
+
 s2s:
   sequence_len: 4
 
 train:
-  max_epochs: 10
+  max_epochs: 15
   scheduler_type: MultiStepLR
   lr: 0.0001
 
-model_type: BERTunet
+pretrained_weights: ~
+model_type: RoPEUNet
 model_args:
   BERTunet:
     n_channels: 9
     n_classes: 3
     bilinear: True
-    h: 412
-    w: 1050
+    h: 210  # 412
+    w: 280  # 1050
+    chan_factor: 1
   DETrajGRU:
     encoder_cahnnels: 2
   VSBERTunet:
@@ -41,6 +63,49 @@ model_args:
   ConvNext:
     n_channels: 9
     n_classes: 3
+  RoPEUNet:
+    n_channels: 7
+    n_classes: 3
+    bilinear: True
+    chan_factor: 1
+    batch_first: False
+    max_T: 10
+    vit_depth: 4
+    vit_heads: 4
+    vit_mlp_ratio: 4.0
+    vit_drop: 0.0
+    vit_attn_drop: 0.0
+    vit_drop_path: 0.0
+    vit_rope_theta: 10000.0
+    vit_rope_mode: "mixed"
+  RoPEConvNeXtV2:
+    in_chans: 9
+    out_channel: 3
+    depths: [3, 3, 9, 3]
+    dims: [64, 128, 256, 512]
+    drop_path_rate: 0.0
+    head_init_scale: 1.0
+    batch_first: False
+    max_T: 10
+    vit_depth: 4
+    vit_heads: 4
+    vit_mlp_ratio: 4.0
+    vit_drop: 0.0
+    vit_attn_drop: 0.0
+    vit_drop_path: 0.0
+    vit_rope_theta: 100.0
+    vit_rope_mode: "mixed"
+
+location_encoding:
+  enabled: True
+  type: siren_sh
+  legendre_polys: 40
+  out_channels: 4
+  dim_hidden: 64
+  num_layers: 2
+  dropout: false
+  w0: 1.0
+  w0_initial: 30.0
 
 betas:
   beta_era: 1
@@ -50,24 +115,27 @@ betas:
 
 run_config:
   run_mode: 'train'
-  num_workers: 16
-  batch_size: 4
-  use_spatial_encoding: 1
+  num_workers: 8
+  batch_size: 8
+  use_spatial_encoding: 0
   use_time_encoding: 1
   use_landmask: 0
   weighted_meaner: 1
   variable_sequence_length: 0
-  use_stations: True
-  use_scatter: True
+  use_stations: False
+  use_scatter: False
 
 loss_config:
   loss_kernel: 'gauss'
   k: 9
 
 test_config:
-  best_epoch_id: 7
-  run_id: 1
+  debug_mode: False
+  best_epoch_id: 6
+  run_id: 2
   draw_plots: 1
+  draw_spectrum: 1
   save_losses: 0
   save_outputs: 0
+  use_stations: True
 

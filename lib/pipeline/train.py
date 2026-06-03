@@ -1,5 +1,6 @@
 import os
 import torch
+import shutil
 from tqdm import tqdm
 from lib.data.data_utils import transform_packed_sequence_multiple
 
@@ -42,8 +43,16 @@ def train_epoch(dataloader, model, criterion, optimizer, wrf_scaler, era_scaler,
     train_loss = 0
     model.train()
     t = 0
-    for train_data, train_label, stations, scatter, dates in (pbar := tqdm(dataloader)):
+    # for train_data, train_label, stations, scatter, dates in (pbar := tqdm(dataloader)):
+    stations = scatter = None
+    for data, dates in (pbar := tqdm(dataloader)):
+        if data is None:
+            print('Empty data batch, continue')
+            continue
+        train_data, train_label = data.pop(cfg.reference_dataset), data.pop(cfg.target_dataset)
+        
         if train_data is None:
+            print(dates, 'Train data is None, continue')
             continue
         # print(train_data.shape, train_label.shape, dates, 'batch shapes and dates')
         # print(wrf_scaler.means.shape, wrf_scaler.stddevs.shape, 'wrf scaler')
@@ -54,12 +63,14 @@ def train_epoch(dataloader, model, criterion, optimizer, wrf_scaler, era_scaler,
         train_label = train_label.flatten(-2, -1)[..., criterion.meaner.target_slice].to(cfg.device)
         train_label = era_scaler.transform(train_label, dims=2)
 
-        if stations is not None:
+        if cfg.run_config.use_stations and 'Stations' in data:
+            stations = data.pop('Stations')
             stations = torch.permute(stations.type(torch.float).to(cfg.device), (1, 0, 3, 2))
             stations = era_scaler.transform(stations, dims=2)
         
         scatter_data, scatter_times = None, None
-        if scatter is not None:
+        if cfg.run_config.use_scatter and 'Scatter' in data:
+            scatter = data.pop('Scatter')
             scatter_times = scatter[0].to(cfg.device).type(torch.double)
             scatter_data = torch.stack((scatter[1], scatter[2]), dim=-3).type(torch.float).to(cfg.device)
             scatter_data = wrf_scaler.transform(scatter_data, dims=2,
@@ -72,12 +83,15 @@ def train_epoch(dataloader, model, criterion, optimizer, wrf_scaler, era_scaler,
         # print('=================================================================')
         # print(train_data.shape, train_label.shape)
         # print(train_data.mean(dim=(0,1,3,4)), train_data.std(dim=(0,1,3,4)))
-        # print(train_label.mean(dim=(0,1,3,4)), train_label.std(dim=(0,1,3,4)))
-        # print(torch.nanmean(stations, dim=(0,1,3)),)# torch.nanstd(stations,dim=(0,1,3)))
-        # print(torch.nanmean(scatter_data, dim=(0,1,3,4)),)# torch.nanstd(scatter_data, dim=(0,1,3,4)))
+        # print(train_data.amax(dim=(0,1,3,4)), train_data.amin(dim=(0,1,3,4)))
+        # print(train_label.mean(dim=(0,1,3)), train_label.std(dim=(0,1,3)))
+        # # print(torch.nanmean(stations, dim=(0,1,3)),)# torch.nanstd(stations,dim=(0,1,3)))
+        # # print(torch.nanmean(scatter_data, dim=(0,1,3,4)),)# torch.nanstd(scatter_data, dim=(0,1,3,4)))
         # print('=================================================================')
+        # print(train_data.shape, train_label.shape, dates, stations, scatter)
+        # print(torch.isnan(train_data).sum(), torch.isnan(train_label).sum(), 'nans')
         output = model(train_data)
-
+        # print(torch.isnan(output).sum(), 'out nans')
         train_data = train_data[:, :, :3]
         loss = criterion(train_data, output, train_label, stations,
                          scatter_data, scatter_times, batch_dates)
@@ -97,20 +111,28 @@ def eval_epoch(model, criterion, wrf_scaler, era_scaler, dataloader, logger, cfg
     with torch.no_grad():
         model.eval()
         valid_loss = 0.0
-        for valid_data, valid_label, stations, scatter, dates in tqdm(dataloader):
-            if valid_data is None:
+        stations = scatter = None
+        for data, dates in tqdm(dataloader):
+            if data is None:
+                print('Empty data batch, continue')
                 continue
+            valid_data, valid_label = data.pop(cfg.reference_dataset), data.pop(cfg.target_dataset)
+            if valid_data is None:
+                print(dates, 'Valid data is None, continue')
+                continue        
+
             valid_data = torch.swapaxes(valid_data.type(torch.float).to(cfg.device), 0, 1).contiguous()
             valid_data = wrf_scaler.transform(valid_data, dims=2)
             valid_label = torch.swapaxes(valid_label.type(torch.float), 0, 1)
             valid_label = valid_label.flatten(-2, -1)[..., criterion.meaner.target_slice].to(cfg.device)
             valid_label = era_scaler.transform(valid_label, dims=2)
-            if stations is not None:
+
+            if cfg.run_config.use_stations and 'Stations' in data:
                 stations = torch.permute(stations.type(torch.float).to(cfg.device), (1, 0, 3, 2))
                 stations = era_scaler.transform(stations, dims=2)
 
             scatter_data, scatter_times = None, None
-            if scatter is not None:
+            if cfg.run_config.use_scatter and 'Scatter' in data:
                 scatter_times = scatter[0].to(cfg.device).type(torch.double)
                 scatter_data = torch.stack((scatter[1], scatter[2]), dim=-3).type(torch.float).to(cfg.device)
                 scatter_data = wrf_scaler.transform(scatter_data, dims=2,

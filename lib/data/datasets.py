@@ -1,11 +1,13 @@
 import os
 import pickle
 import random
+import datetime
 from abc import abstractmethod
 from pathlib import Path
 
 import wrf
 import netCDF4
+import pygrib
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -110,18 +112,20 @@ class NCs2sDataset(Dataset):
     def get_data_by_id(self, date, length=None):
         needed_len = self.seq_len if length is None else length
         npys = []
+        # print(date, 'input date')
+        hours_in_file = get_hours_in_period(date, self._file_len)
         hour = (date.astype('datetime64[h]') - date.astype(f'datetime64[{self._file_len}]')).astype(int)
         file = date.astype(f'datetime64[{self._file_len}]')
+        # print(hour, file, 'hour file')
         while needed_len > 0:
             times = np.arange(0, get_hours_in_period(date, self._file_len))[hour:hour + needed_len*self.time_res_h:self.time_res_h]
             try:
                 file_vars = self.load_file_vars(str(self.dates_dict[file][0]), self.data_variables, times)
-            except IndexError:
-                print(date)
-                print("No data for this dates")
+            except (IndexError, KeyError):
                 return None
-            hour = 0
-            file = file + np.timedelta64(1, self._file_len)
+            hour = self.time_res_h - (hours_in_file-times[-1])
+            file = file + np.timedelta64(1 + hour // hours_in_file, self._file_len)
+            hour = hour % hours_in_file
             npys.append(file_vars)
             needed_len -= len(file_vars)
         return np.concatenate(npys) 
@@ -211,7 +215,7 @@ class WRFs2sDataset(NCs2sDataset):
 
     @property
     def _files_template(self):
-        return '*wrfout*'
+        return '**/*wrfout*'
 
     def _create_grid(self):
         grid_path = sorted(self.path.glob(self._files_template))[0]
@@ -225,6 +229,10 @@ class WRFs2sDataset(NCs2sDataset):
     @property
     def _file_len(self):
         return 'D'
+    
+    @property
+    def name(self):
+        return 'WRF'
 
 
 
@@ -255,6 +263,10 @@ class ERAs2sDataset(NCs2sDataset):
     @property
     def _file_len(self):
         return 'D'
+    
+    @property
+    def name(self):
+        return 'ERA5'
 
         
 class ERAMonthlyDataset(ERAs2sDataset):
@@ -270,6 +282,113 @@ class ERAMonthlyDataset(ERAs2sDataset):
     @property
     def _file_len(self):
         return 'M'
+    
+
+class GFSgribDataset(NCs2sDataset):
+    def _create_grid(self):
+        grid_path = sorted(self.path.glob(self._files_template))[0]
+        print(f'loading grid from {grid_path}')
+        with pygrib.open(grid_path) as ds:
+            # Read the first message (assuming grid is consistent across messages)
+            grb = ds.read(1)[0]
+            # Extract latitude/longitude arrays (2D grids)
+            lat, lon = grb.latlons()
+        lon = lon_to_180_range(lon) 
+        # Create and return a Grid object
+        grid = {'longitude': lon, 'latitude': lat}
+        return grid
+
+    def load_file_vars(self, filename, variables, times):
+        out = []
+        print(filename)
+        with pygrib.open(filename) as ds:
+            for i in variables:
+                try:
+                    layer = [k for k in ds.select(name=i)]
+                except ValueError:
+                    print('Value Error')
+                # check if param unique in grib
+                if len(layer) != 1:
+                    print(f'file has {len(layer)} params, must be 1')
+                layer = layer[0]
+                geophysical_data, lats, lons = layer.data()
+                out.append(geophysical_data)
+        return np.stack(out)[None]
+
+    @staticmethod
+    def _parse_date(file):
+        # Extract the date part from the filename and parse it
+        date_part = file.stem.split('.')[-2]
+        date = datetime.datetime.strptime(date_part, '%Y%m%d%H')  # Parse as 'YYYYMMDDHH'
+        date = np.datetime64(date)
+        return date
+    
+    @property
+    def _files_template(self):
+        return 'gfs.*.f*.grib2'
+    
+    @property
+    def _file_len(self):
+        return '6h'
+    
+    @property
+    def name(self):
+        return 'GFS'
+
+
+class GFSncDataset(NCs2sDataset):
+    @staticmethod
+    def _parse_date(file):
+        # Extract the date part from the filename and parse it
+        date_part = file.stem.split('.')[-2]
+        date = datetime.datetime.strptime(date_part, '%Y%m%d%H')  # Parse as 'YYYYMMDDHH'
+        date = np.datetime64(date)
+        return date
+    
+    @property
+    def _files_template(self):
+        return '**/gfs*.nc'
+
+    def _create_grid(self):
+        grid_path = sorted(self.path.glob(self._files_template))[0]
+        print(f'Loading grid from {grid_path}')
+        with xr.open_dataset(grid_path, cache=False) as ds:
+            lat = ds['latitude'].values
+            lon = ds['longitude'].values
+            lon = lon_to_180_range(lon) 
+            if len(lat.shape) == 1:  # 1D vectors
+                lon, lat = np.meshgrid(lon, lat)
+            grid = {'longitude': lon, 'latitude': lat}
+        return grid
+    
+    @property
+    def _file_len(self):
+        return '6h'
+    
+    @property
+    def name(self):
+        return 'GFS'
+    
+    # def get_data_by_id(self, date, length=None):
+    #     needed_len = self.seq_len if length is None else length
+    #     npys = []
+    #     hour = (date.astype('datetime64[h]') - date.astype(f'datetime64[{self._file_len}]')).astype(int)
+    #     file = date.astype(f'datetime64[{self._file_len}]')
+    #     while needed_len > 0:
+    #         print(file)
+    #         times = np.arange(0, 48)[hour:hour + needed_len*self.time_res_h:self.time_res_h]  # todo fix kostyl
+    #         try:
+    #             file_vars = self.load_file_vars(str(self.dates_dict[file][0]), self.data_variables, times)
+    #         except IndexError:
+    #             print(date)
+    #             print("No data for this dates")
+    #             return None
+    #         hour = 0
+    #         file = file + np.timedelta64(1, self._file_len)
+    #         npys.append(file_vars)
+    #         needed_len -= len(file_vars)
+    #     return np.concatenate(npys) 
+
 
 class ScatterNoneDataset(Dataset):
     def __getitem__(self, index, *args, **kwargs):
@@ -312,7 +431,7 @@ class StationsDataset(Dataset):
             data_variables = ['TC']
         if wind_variables is None:
             wind_variables = ['WSPD10', 'WDIR10_angle_interp']
-        assert wind_format in ('uv', 'wd'), "wind_format must be 'uv' or 'wd'"
+        assert wind_format in ('uv', 'wd', 'w'), "wind_format must be 'uv' or 'wd' or 'w"
         
         self.data_variables = wind_variables + data_variables
         self.time_variable = time_variable
@@ -323,6 +442,7 @@ class StationsDataset(Dataset):
         self.stations = self.load_stations(self.station_files)
         self.dates_dict = self._create_dates_dict()
         self.src_grid = self._create_grid()
+        self.grid = Dict(self.src_grid)
 
     @staticmethod
     def angle_to_sector_class(angle: np.ndarray, num_sectors: int = 16) -> np.ndarray:
@@ -393,7 +513,7 @@ class StationsDataset(Dataset):
         # sample u,v for wind: speed idx=0, angle idx=1
         if self.wind_format == 'uv':
             seq = self._sample_uv(arr=seq, ws_idx=0, ang_idx=1, sector_size=360/16, rng=self.rng)
-        else:
+        elif self.wind_format == 'wd':
             out = seq.copy()
             speed = out[..., 0]
             angle = out[..., 1]
@@ -409,6 +529,10 @@ class StationsDataset(Dataset):
     @property
     def _files_template(self):
         return '*.pkl'
+
+    @property
+    def name(self):
+        return 'Stations'
 
 
 class ScatterDataset(Dataset):
@@ -426,6 +550,7 @@ class ScatterDataset(Dataset):
         self.datasets = self._load_datasets()
         self.time_index = self._build_time_index()
         self.src_grid = self._create_grid()  # Create the grid
+        self.grid = Dict(self.src_grid)
         self.dict_out = dict_out
 
     def _load_datasets(self):
@@ -522,6 +647,10 @@ class ScatterDataset(Dataset):
                 eastward_wind_seq,
                 northward_wind_seq,
             )
+
+    @property
+    def name(self):
+        return 'Scatter'
 
 class IFSs2sDataset(NCs2sDataset):
     @staticmethod
@@ -620,10 +749,26 @@ class IFSs2sDataset(NCs2sDataset):
             current_time += pd.DateOffset(hours=6)
         
         return np.stack(npys, axis=0)  # (time, vars, H, W)
+    
     def __getitem__(self, date):
         """Now accepts direct datetime64 input"""
         return self.get_data_by_id(date)    
+    
+    @property
+    def name(self):
+        return 'IFS'
 
+class DictDataset(Dataset):
+    def __init__(self, *datasets, **named_datasets):
+        self._length = len(datasets[0])
+        self.datasets = {**{dataset.name: dataset for dataset in datasets}, **named_datasets}
+
+    def __getitem__(self, index):
+        return {name: dataset[index] for name, dataset in self.datasets.items()}
+
+    def __len__(self):
+        return self._length
+    
 
 class StackDataset(Dataset):
     def __init__(self, *datasets):
@@ -643,7 +788,14 @@ class ConcatDataset(Dataset):
         self.cat_dim=cat_dim
 
     def __getitem__(self, idx):
-        return np.concatenate([ds[idx] for ds in self.datasets], axis=self.cat_dim)
+        samples = [ds[idx] for ds in self.datasets]
+
+        # If any source sample is missing, the whole concatenated sample is missing
+        if any(sample is None for sample in samples):
+            # print(idx, 'some of datasets to concat returned None')
+            return None
+
+        return np.concatenate(samples, axis=self.cat_dim)
     
     def __len__(self):
         return self._length
@@ -672,7 +824,7 @@ def dataset_with_indices(cls):
 
     def __getitem__(self, index):
         data = cls.__getitem__(self, index)
-        return *data, index
+        return data, index
 
     return type(cls.__name__, (cls,), {
         '__getitem__': __getitem__,

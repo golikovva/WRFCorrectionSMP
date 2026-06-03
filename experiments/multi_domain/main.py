@@ -2,6 +2,7 @@ import os
 import sys
 import copy
 import yaml
+import re
 import importlib.util
 from collections.abc import Mapping
 
@@ -11,6 +12,9 @@ sys.path.insert(0, '/home')
 sys.path.insert(0, '../../')
 
 from lib.config.cfg import Config
+
+
+_MISC_DIR_RE = re.compile(r'^misc_(\d+)$')
 
 
 def _to_serializable(obj):
@@ -53,8 +57,10 @@ def _deep_update(dst, src):
 
 
 def _load_single_stage_main():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         "/home/experiments/train_test/main.py",
+        os.path.abspath(os.path.join(current_dir, "..", "train_test", "main.py")),
     ]
 
     for path in candidates:
@@ -68,6 +74,40 @@ def _load_single_stage_main():
         "Could not find the single-stage trainer. Tried:\n"
         + "\n".join(candidates)
     )
+
+
+def _sanitize_path_part(value):
+    value = str(value).strip()
+    value = re.sub(r'[<>:"/\\|?*\s]+', '_', value)
+    value = re.sub(r'_+', '_', value).strip('._')
+    return value or 'unnamed'
+
+
+def _next_misc_name(parent_dir):
+    if not os.path.isdir(parent_dir):
+        return 'misc_1'
+
+    numbers = []
+    for name in os.listdir(parent_dir):
+        match = _MISC_DIR_RE.match(name)
+        if match is not None:
+            numbers.append(int(match.group(1)))
+
+    return f"misc_{max(numbers, default=0) + 1}"
+
+
+def _allocate_pipeline_run_dir(logs_folder, model_name, experiment_name=None):
+    model_dir = os.path.join(logs_folder, _sanitize_path_part(model_name))
+    os.makedirs(model_dir, exist_ok=True)
+
+    if experiment_name not in (None, ''):
+        run_name = _sanitize_path_part(experiment_name)
+    else:
+        run_name = _next_misc_name(model_dir)
+
+    run_dir = os.path.join(model_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
 
 
 def _resolve_init_weights(stage_cfg, finished_stages):
@@ -96,16 +136,26 @@ def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
     single_stage_main, single_stage_path = _load_single_stage_main()
 
     base_config_path = pipeline_cfg.base_config_path
-    experiment_name = pipeline_cfg.get('experiment_name', 'multi_domain_experiment')
-    pipeline_logs_folder = pipeline_cfg.get('pipeline_logs_folder', '/home/logs/multi_domain')
+    base_cfg = Config.fromfile(base_config_path)
+    experiment_name = pipeline_cfg.get('experiment_name', None)
+    pipeline_logs_folder = pipeline_cfg.get('pipeline_logs_folder', base_cfg.data.logs_folder)
+    model_name = pipeline_cfg.get('model_name', base_cfg.model_type)
 
-    pipeline_dir = os.path.join(pipeline_logs_folder, experiment_name)
-    os.makedirs(pipeline_dir, exist_ok=True)
+    pipeline_dir = _allocate_pipeline_run_dir(
+        pipeline_logs_folder,
+        model_name,
+        experiment_name,
+    )
+    resolved_configs_dir = os.path.join(pipeline_dir, "resolved_configs")
+    os.makedirs(resolved_configs_dir, exist_ok=True)
 
     summary = {
         'experiment_name': experiment_name,
+        'model_name': model_name,
         'multi_config_path': multi_cfg_path,
         'base_config_path': base_config_path,
+        'save_dir': pipeline_dir,
+        'resolved_configs_dir': resolved_configs_dir,
         'single_stage_trainer_path': single_stage_path,
         # 'device': "cuda" if torch.cuda.is_available() else "cpu",
         'stages': [],
@@ -132,23 +182,30 @@ def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
             stage_base_cfg['pretrained_weights'] = None
 
         resolved_stage_cfg_path = os.path.join(
-            pipeline_dir,
-            f"{stage_idx:02d}_{stage_name}_resolved_config.yaml"
+            resolved_configs_dir,
+            f"stage_{stage_idx:02d}_{_sanitize_path_part(stage_name)}.yaml"
         )
         stage_base_cfg.save_config(resolved_stage_cfg_path)
 
-        folder_name = f"{experiment_name}__{stage_idx:02d}_{stage_name}"
+        stage_dir = os.path.join(
+            pipeline_dir,
+            f"stage_{stage_idx:02d}_{_sanitize_path_part(stage_name)}",
+        )
 
         stage_result = single_stage_main(
             stage_base_cfg,
             results=None,
-            folder_name=folder_name,
+            folder_name=stage_name,
             stage_name=stage_name,
             save_metadata=True,
             baselines_only=False,
+            save_dir=stage_dir,
         )
 
         stage_result = _to_serializable(stage_result)
+        stage_result['stage_index'] = stage_idx
+        stage_result['stage_name'] = stage_name
+        stage_result['stage_dir'] = stage_dir
         stage_result['resolved_config_path'] = resolved_stage_cfg_path
         stage_result['init_weights_from'] = stage.get('init_weights_from', None)
 

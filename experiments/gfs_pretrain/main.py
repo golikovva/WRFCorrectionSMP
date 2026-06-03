@@ -108,7 +108,7 @@ def main(cfg):
     criterion = HeterogenousMSLoss(meaner, betas, stations_interpolator, scat_interpolator,
                                     logger=logger,kernel_type=cfg.loss_config.loss_kernel,
                                     k=cfg.loss_config.k, device=cfg.device).to(cfg.device).float()
-    model = build_correction_model(cfg)
+    model = build_correction_model(cfg, grid=gfs_dataset.src_grid)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.train.lr, weight_decay=1e-5)
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[15, 25], gamma=0.2)

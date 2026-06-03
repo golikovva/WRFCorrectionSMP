@@ -1,0 +1,23 @@
+RoPEUnetBoreyPTNestpFT:
+  path: '/home/logs/multi_domain_experiment__01_finetune_nestp/misc_1/config_used.yaml'
+  model_path: '/home/logs/multi_domain_experiment__01_finetune_nestp/misc_1/models/model_5.pth'
+
+RoPEUnetBoreyPT:
+  path: '/home/logs/multi_domain_experiment__00_pretrain_borey/misc_1/config_used.yaml'
+  model_path: '/home/logs/multi_domain_experiment__00_pretrain_borey/misc_1/models/model_10.pth'
+
+RoPEUnetNestp:
+  path: '/home/logs/RoPEUNet/misc_15/config_used.yaml'
+  model_path: '/home/logs/RoPEUNet/misc_15/models/model_11.pth'
+
+RoPEConvNextBoreyPTNestpFT:
+  path: '/home/logs/multi_domain_experiment__01_finetune_nestp/misc_2/config_used.yaml'
+  model_path: '/home/logs/multi_domain_experiment__01_finetune_nestp/misc_2/models/model_10.pth'
+
+RoPEConvNextBoreyPT:
+  path: '/home/logs/multi_domain_experiment__00_pretrain_borey/misc_3/config_used.yaml'
+  model_path: '/home/logs/multi_domain_experiment__00_pretrain_borey/misc_3/models/model_0.pth'
+
+RoPEConvNextNestp:
+  path: '/home/logs/RoPEConvNeXt/misc_2/config_used.yaml'
+  model_path: '/home/logs/RoPEConvNeXt/misc_2/models/model_6.pth'

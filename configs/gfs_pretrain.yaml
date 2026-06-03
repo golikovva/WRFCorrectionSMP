@@ -16,22 +16,23 @@ data:
 
 reference_dataset: GFS
 target_dataset: ERA5
+reference_region: global
 
 s2s:
-  sequence_len: 2
+  sequence_len: 1
 
 train:
   max_epochs: 40
   scheduler_type: MultiStepLR
   lr: 0.0001
 
-model_type: BERTunet
+model_type: UNet
 model_args:
   BERTunet:
     n_channels: 7
     n_classes: 3
     bilinear: True
-    h: 721 #412
+    h: 720 #412
     w: 1440 #1050
     chan_factor: 1
   DETrajGRU:
@@ -45,6 +46,94 @@ model_args:
   ConvNext:
     n_channels: 9
     n_classes: 3
+  UNet:
+    n_channels: 7
+    n_classes: 3
+    bilinear: True
+  ViT:
+    in_channels: 7
+    out_channels: 3
+    h_channels: 256
+    img_size: [720, 1440]
+    patch_size: 20
+    depth: 12
+    decoder_depth: 4
+    num_heads: 16
+    mlp_ratio: 4
+    drop_path: 0
+    drop_rate: 0
+    per_var_embedding: True
+  SwinLSTM_B:
+    img_size: [720, 1440]
+    patch_size: 12
+    in_chans: 7
+    embed_dim: 128
+    depths: 6
+    num_heads: 16
+    window_size: 4
+    drop_rate: 0
+    attn_drop_rate: 0
+    drop_path_rate: 0
+  SwinLSTM_D:
+    img_size: [720, 1440]
+    patch_size: 2
+    window_size: 6
+    in_chans: 7
+    embed_dim: 128
+    depths_downsample: [2, 6]
+    depths_upsample: [6, 2]
+    num_heads: [4, 8]
+  TimeSformer:
+    img_size: [720, 1440]
+    patch_size: 12
+    in_chans: 7
+    out_chans: 3
+    embed_dim: 512
+    num_frames: 4
+    depth: 12
+    decoder_depth: 4
+    num_heads: 16
+    mlp_ratio: 4
+    attention_type: divided_space_time
+  CNN2D:
+    input_size: [720, 1440]
+    n_layers: 5
+    in_time_points: 7
+    out_time_points: 3
+  CNN3D:
+    input_size: [720, 1440]
+    n_layers: 2
+    in_time_points: 7
+    out_time_points: 3
+    convolve_params: 
+      kernel_size: [7, 3, 3]
+    transpose_convolve_params:
+      kernel_size: [7, 3, 3]
+    conv_dim: 3
+  RoPEUNet:
+    n_channels: 9
+    n_classes: 3
+    bilinear: True
+    max_T: 10
+    vit_depth: 4
+    vit_heads: 4
+    vit_mlp_ratio: 4.0
+    vit_drop: 0.0
+    vit_attn_drop: 0.0
+    vit_drop_path: 0.0
+    vit_rope_theta: 10000.0
+    vit_rope_mode: "mixed"
+
+location_encoding:
+  enabled: false
+  type: siren_sh
+  legendre_polys: 20
+  out_channels: 8
+  dim_hidden: 64
+  num_layers: 2
+  dropout: false
+  w0: 1.0
+  w0_initial: 30.0
 
 betas:
   beta_era: 1
@@ -69,9 +158,11 @@ loss_config:
   k: 9
 
 test_config:
-  best_epoch_id: 14
-  run_id: 2
+  debug_mode: False
+  best_epoch_id: 13
+  run_id: 23
   draw_plots: 1
+  draw_spectrum: 0
   save_losses: 0
   save_outputs: 0
 
