@@ -8,27 +8,36 @@ import pickle
 
 
 class WRFLogger:
-    def __init__(self, cfg, base_log_dir=None, folder_name=None):
-        if base_log_dir is None:
-            base_log_dir = '/home/logs'
-        if folder_name is None:
-            folder_name = 'unknown'
-
-        if not os.path.exists(os.path.join(base_log_dir, folder_name)):
-            os.makedirs(os.path.join(base_log_dir, folder_name))
-        self.folder_path = os.path.join(base_log_dir, folder_name)
-
-        if cfg.run_config.run_mode == 'test':
-            self.experiment_number = cfg.test_config.run_id
+    def __init__(self, cfg, base_log_dir=None, folder_name=None, save_dir=None):
+        if save_dir is not None:
+            self.save_dir = os.fspath(save_dir)
+            os.makedirs(self.save_dir, exist_ok=True)
+            self.folder_path = os.path.dirname(self.save_dir)
+            self.experiment_number = os.path.basename(self.save_dir)
         else:
-            self.experiment_number = self.get_experiment_number()
+            if base_log_dir is None:
+                base_log_dir = '/home/logs'
+            if folder_name is None:
+                folder_name = 'unknown'
 
-        self.save_dir = os.path.join(self.folder_path, f'misc_{self.experiment_number}')
+            if not os.path.exists(os.path.join(base_log_dir, folder_name)):
+                os.makedirs(os.path.join(base_log_dir, folder_name))
+            self.folder_path = os.path.join(base_log_dir, folder_name)
+
+            if cfg.run_config.run_mode == 'test':
+                self.experiment_number = cfg.test_config.run_id
+            else:
+                self.experiment_number = self.get_experiment_number()
+
+            self.save_dir = os.path.join(self.folder_path, f'misc_{self.experiment_number}')
+
         self.model_save_dir = os.path.join(self.save_dir, 'models')
         self.log_dir = os.path.join(self.save_dir, 'logs')
+        self.plots_dir = os.path.join(self.save_dir, 'plots')
 
         os.makedirs(self.log_dir) if not os.path.exists(self.log_dir) else None
         os.makedirs(self.model_save_dir) if not os.path.exists(self.model_save_dir) else None
+        os.makedirs(self.plots_dir) if not os.path.exists(self.plots_dir) else None
 
         self.logger = self.create_logger()
         self.logger.info(f"Testing the custom logger for module {__name__}...")
@@ -45,14 +54,17 @@ class WRFLogger:
         self.betas = [1]
 
     def create_logger(self):
-        logger = logging.getLogger(__name__)
+        logger_name = f"{__name__}.{abs(hash(os.path.abspath(self.save_dir)))}"
+        logger = logging.getLogger(logger_name)
         logger.setLevel(logging.INFO)
+        logger.propagate = False
 
         handler = logging.FileHandler(f"{os.path.join(self.log_dir, __name__)}.log", mode='a')
         formatter = logging.Formatter("%(name)s %(asctime)s %(levelname)s %(message)s")
 
         handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        if not logger.handlers:
+            logger.addHandler(handler)
         return logger
 
     def get_experiment_number(self):

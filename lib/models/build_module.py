@@ -1,72 +1,154 @@
+import copy
 import torch
-from lib.models.unet import UNet
-from lib.models.bertunet import BERTUNet, S2SBERTUnet
-from lib.models.vit import ViT
-from lib.models.timesformer import TimeSformer
 from lib.models.model import Corrector, LowFreqCorrector, i2itos2s
-from lib.models.convnext import ConvNeXtV2, ConvNeXtV2LatentVit
+from lib.models.location_encoding import InputChannelAppender, build_siren_sh_encoder
 
-def build_correction_model(cfg):
+
+def _cfg_get(section, key, default=None):
+    if section is None:
+        return default
+    if isinstance(section, dict):
+        return section.get(key, default)
+    try:
+        return getattr(section, key)
+    except (AttributeError, KeyError):
+        return default
+
+
+def _enabled_location_encoding(cfg):
+    location_cfg = _cfg_get(cfg, "location_encoding")
+    if location_cfg is None or not bool(_cfg_get(location_cfg, "enabled", False)):
+        return None
+    return location_cfg
+
+
+def _location_out_channels(location_cfg):
+    return int(_cfg_get(location_cfg, "out_channels", 8)) if location_cfg is not None else 0
+
+
+def _model_args(args, extra_channels=0, channel_keys=("n_channels",)):
+    args = copy.deepcopy(dict(args))
+    if extra_channels <= 0:
+        return args
+
+    for key in channel_keys:
+        if key in args:
+            args[key] = int(args[key]) + extra_channels
+            return args
+    raise KeyError(f"Cannot add location encoding channels; none of {channel_keys} found in model args")
+
+
+def _wrap_with_location_encoder(model, location_cfg, grid):
+    if location_cfg is None:
+        return model
+    encoder = build_siren_sh_encoder(grid, location_cfg)
+    return InputChannelAppender(model, encoder)
+
+
+def _convnext_args(args, extra_channels):
+    args = _model_args(args, extra_channels, ("in_chans", "n_channels"))
+    if "n_channels" in args and "in_chans" not in args:
+        args["in_chans"] = args.pop("n_channels")
+    if "n_classes" in args and "out_channel" not in args:
+        args["out_channel"] = args.pop("n_classes")
+    return args
+
+
+def build_correction_model(cfg, grid=None):
     model_type = cfg.model_type.lower()
+    location_cfg = _enabled_location_encoding(cfg)
+    extra_channels = _location_out_channels(location_cfg)
     if model_type == "bertunet":
-        unet = BERTUNet(**cfg.model_args.BERTunet)
+        from lib.models.bertunet import BERTUNet
+        unet = BERTUNet(**_model_args(cfg.model_args.BERTunet, extra_channels, ("n_channels",)))
+        unet = _wrap_with_location_encoder(unet, location_cfg, grid)
         model = Corrector(unet).to(cfg.device)
     elif model_type == "bertunet_raw":
-        model = BERTUNet(**cfg.model_args.BERTunet).to(cfg.device)
+        from lib.models.bertunet import BERTUNet
+        model = BERTUNet(**_model_args(cfg.model_args.BERTunet, extra_channels, ("n_channels",)))
+        model = _wrap_with_location_encoder(model, location_cfg, grid).to(cfg.device)
     elif model_type == 'bertunet_lfreq':
-        unet = BERTUNet(**cfg.model_args.BERTunet)
+        from lib.models.bertunet import BERTUNet
+        unet = BERTUNet(**_model_args(cfg.model_args.BERTunet, extra_channels, ("n_channels",)))
+        unet = _wrap_with_location_encoder(unet, location_cfg, grid)
         model = LowFreqCorrector(unet).to(cfg.device)
     elif model_type == 'vsbertunet':
-        unet = S2SBERTUnet(**cfg.model_args.VSBERTunet)
+        from lib.models.bertunet import S2SBERTUnet
+        unet = S2SBERTUnet(**_model_args(cfg.model_args.VSBERTunet, extra_channels, ("n_channels",)))
+        unet = _wrap_with_location_encoder(unet, location_cfg, grid)
         model = Corrector(unet).to(cfg.device)
     elif model_type == 'unet':
+        from lib.models.unet import UNet
         print('Building UNet model...')
-        unet = i2itos2s(UNet)(**cfg.model_args.UNet)
+        unet = i2itos2s(UNet)(**_model_args(cfg.model_args.UNet, extra_channels, ("n_channels",)))
+        unet = _wrap_with_location_encoder(unet, location_cfg, grid)
         model = Corrector(unet).to(cfg.device)
     elif model_type == 'vit':
+        from lib.models.vit import ViT
         print('Building ViT model...')
-        unet = i2itos2s(ViT)(**cfg.model_args.ViT)
+        unet = i2itos2s(ViT)(**_model_args(cfg.model_args.ViT, extra_channels, ("in_channels",)))
+        unet = _wrap_with_location_encoder(unet, location_cfg, grid)
         model = Corrector(unet).to(cfg.device)
     elif model_type == 'swinlstm_b':
         print('Building ViT model...')
         from .swinLSTM_B import SwinLSTM
-        unet = SwinLSTM(**cfg.model_args.SwinLSTM_B)
+        unet = SwinLSTM(**_model_args(cfg.model_args.SwinLSTM_B, extra_channels, ("in_chans",)))
+        unet = _wrap_with_location_encoder(unet, location_cfg, grid)
         model = Corrector(unet).to(cfg.device)
     elif model_type == 'swinlstm_d':
         print('Building swinlstm_d model...')
         from .swinLSTM_D import SwinLSTM
-        unet = SwinLSTM(**cfg.model_args.SwinLSTM_D)
+        unet = SwinLSTM(**_model_args(cfg.model_args.SwinLSTM_D, extra_channels, ("in_chans",)))
+        unet = _wrap_with_location_encoder(unet, location_cfg, grid)
         model = Corrector(unet).to(cfg.device)
     elif model_type == 'timesformer':
+        from lib.models.timesformer import TimeSformer
         print('Building TimeSformer model...')
-        unet = TimeSformer(**cfg.model_args.TimeSformer)
+        unet = TimeSformer(**_model_args(cfg.model_args.TimeSformer, extra_channels, ("in_chans",)))
+        unet = _wrap_with_location_encoder(unet, location_cfg, grid)
         model = Corrector(unet).to(cfg.device)
     elif model_type == 'cnn2d':
         from torchcnnbuilder.models import ForecasterBase
-        backbone = i2itos2s(ForecasterBase)(**cfg.model_args.CNN2D)
+        backbone = i2itos2s(ForecasterBase)(**_model_args(
+            cfg.model_args.CNN2D,
+            extra_channels,
+            ("in_channels", "input_channels", "n_channels", "in_chans"),
+        ))
+        backbone = _wrap_with_location_encoder(backbone, location_cfg, grid)
         model = Corrector(backbone).to(cfg.device)
     elif model_type == 'cnn3d':
         from torchcnnbuilder.models import ForecasterBase
-        backbone = i2itos2s(ForecasterBase)(**cfg.model_args.CNN3D)
+        backbone = i2itos2s(ForecasterBase)(**_model_args(
+            cfg.model_args.CNN3D,
+            extra_channels,
+            ("in_channels", "input_channels", "n_channels", "in_chans"),
+        ))
+        backbone = _wrap_with_location_encoder(backbone, location_cfg, grid)
         model = Corrector(backbone).to(cfg.device)
     elif model_type == 'ropeunet':
         from lib.models.unet_rope import RoPEUNet
-        model = RoPEUNet(**cfg.model_args.RoPEUNet).to(cfg.device)
+        model = RoPEUNet(**_model_args(cfg.model_args.RoPEUNet, extra_channels, ("n_channels",)))
+        model = _wrap_with_location_encoder(model, location_cfg, grid).to(cfg.device)
         # model = Corrector(backbone).to(cfg.device)
     elif model_type == 'convnext':
-        unet = i2itos2s(ConvNeXtV2)(**cfg.model_args.ConvNext)
+        from lib.models.convnext import ConvNeXtV2
+        unet = i2itos2s(ConvNeXtV2)(**_convnext_args(cfg.model_args.ConvNext, extra_channels))
+        unet = _wrap_with_location_encoder(unet, location_cfg, grid)
         model = Corrector(unet).to(cfg.device)
     elif model_type == 'ropeconvnext':
-        model = ConvNeXtV2LatentVit(**cfg.model_args.RoPEConvNeXtV2).to(cfg.device)
+        from lib.models.convnext import ConvNeXtV2LatentVit
+        model = ConvNeXtV2LatentVit(**_model_args(cfg.model_args.RoPEConvNeXtV2, extra_channels, ("in_chans",)))
+        model = _wrap_with_location_encoder(model, location_cfg, grid).to(cfg.device)
     elif model_type == 'aurora':
         pass
     else:
-        raise TypeError
+        raise TypeError(f"Unknown model_type={cfg.model_type!r}")
     return model
 
 
 def build_inference_correction_model(cfg):
     if cfg['model_type'] == "BERTunet":
+        from lib.models.bertunet import BERTUNet
         unet = BERTUNet(n_channels=9, n_classes=3, bilinear=True)
         model = Corrector(unet).to(cfg['device'])
         state_dict = torch.load(cfg['model_weights'])

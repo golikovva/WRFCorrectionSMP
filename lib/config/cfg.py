@@ -7,6 +7,7 @@ from importlib import import_module
 from addict import Dict
 sys.path.insert(0, './../../')
 
+_MISSING = object()
 
 class ConfigDict(Dict):
 
@@ -16,37 +17,58 @@ class ConfigDict(Dict):
     def __getattr__(self, name):
         try:
             value = super(ConfigDict, self).__getattr__(name)
-        except KeyError:
-            ex = AttributeError("'{}' object has no attribute '{}'".format(
-                self.__class__.__name__, name))
-        except Exception as e:
-            ex = e
-        else:
-            return value
-        raise ex
+        except KeyError as e:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            ) from e
+        return value
 
 
 def add_args(parser, cfg, prefix=''):
     for k, v in cfg.items():
-        if isinstance(v, str):
-            parser.add_argument('--' + prefix + k)
+        arg_name = '--' + prefix + k
+
+        if isinstance(v, bool):
+            parser.add_argument(arg_name, type=yaml.safe_load)
         elif isinstance(v, int):
-            parser.add_argument('--' + prefix + k, type=int)
+            parser.add_argument(arg_name, type=int)
         elif isinstance(v, float):
-            parser.add_argument('--' + prefix + k, type=float)
-        elif isinstance(v, bool):
-            parser.add_argument('--' + prefix + k, action='store_true')
+            parser.add_argument(arg_name, type=float)
+        elif isinstance(v, str):
+            parser.add_argument(arg_name, type=str)
+        elif v is None:
+            parser.add_argument(arg_name, type=yaml.safe_load)
         elif isinstance(v, dict):
             add_args(parser, v, k + '.')
+        elif isinstance(v, list):
+            parser.add_argument(arg_name, type=yaml.safe_load)
         else:
-            print('connot parse key {} of type {}'.format(prefix + k, type(v)))
+            print(f'cannot parse key {prefix + k} of type {type(v)}')
     return parser
-
 
 class Config(object):
     @staticmethod
+    def _wrap(obj):
+        """
+        Recursively convert plain dicts into ConfigDict,
+        and recurse into lists/tuples. None stays None.
+        """
+        if isinstance(obj, ConfigDict):
+            return obj
+        elif isinstance(obj, dict):
+            wrapped = ConfigDict()
+            for k, v in obj.items():
+                wrapped[k] = Config._wrap(v)
+            return wrapped
+        elif isinstance(obj, list):
+            return [Config._wrap(v) for v in obj]
+        elif isinstance(obj, tuple):
+            return tuple(Config._wrap(v) for v in obj)
+        else:
+            return obj
+
+    @staticmethod
     def fromfile(filename):
-        # filename = osp.abspath(osp.expanduser(filename))
         if filename.endswith('.py'):
             module_name = osp.basename(filename)[:-3]
             if '.' in module_name:
@@ -63,19 +85,20 @@ class Config(object):
         elif filename.endswith(('.yml', '.yaml')):
             with open(filename, 'r') as file:
                 cfg_dict = yaml.safe_load(file)
-            # cfg_dict = mmcv.load(filename)
+            if cfg_dict is None:
+                cfg_dict = {}
         else:
             raise IOError('Only py/yml/yaml/json type are supported now!')
+
         return Config(cfg_dict, filename=filename)
 
     @staticmethod
     def auto_argparser(description=None):
-        """Generate argparser from config file automatically (experimental)
-        """
         partial_parser = ArgumentParser(description=description)
         partial_parser.add_argument('config', help='config file path')
         cfg_file = partial_parser.parse_known_args()[0].config
-        cfg = Config.from_file(cfg_file)
+        cfg = Config.fromfile(cfg_file)
+
         parser = ArgumentParser(description=description)
         parser.add_argument('config', help='config file path')
         add_args(parser, cfg)
@@ -83,13 +106,13 @@ class Config(object):
 
     def __init__(self, cfg_dict=None, filename=None):
         if cfg_dict is None:
-            cfg_dict = dict()
+            cfg_dict = {}
         elif not isinstance(cfg_dict, dict):
-            raise TypeError('cfg_dict must be a dict, but got {}'.format(
-                type(cfg_dict)))
+            raise TypeError(f'cfg_dict must be a dict, but got {type(cfg_dict)}')
 
-        super(Config, self).__setattr__('_cfg_dict', ConfigDict(cfg_dict))
+        super(Config, self).__setattr__('_cfg_dict', self._wrap(cfg_dict))
         super(Config, self).__setattr__('_filename', filename)
+
         if filename:
             with open(filename, 'r') as f:
                 super(Config, self).__setattr__('_text', f.read())
@@ -105,8 +128,7 @@ class Config(object):
         return self._text
 
     def __repr__(self):
-        return 'Config (path: {}): {}'.format(self.filename,
-                                              self._cfg_dict.__repr__())
+        return f'Config (path: {self.filename}): {self._cfg_dict!r}'
 
     def __len__(self):
         return len(self._cfg_dict)
@@ -115,58 +137,67 @@ class Config(object):
         return getattr(self._cfg_dict, name)
 
     def __getitem__(self, name):
-        return self._cfg_dict.__getitem__(name)
+        return self._cfg_dict[name]
 
     def __setattr__(self, name, value):
-        if isinstance(value, dict):
-            value = ConfigDict(value)
-        self._cfg_dict.__setattr__(name, value)
+        self._cfg_dict.__setattr__(name, self._wrap(value))
 
     def __setitem__(self, name, value):
-        if isinstance(value, dict):
-            value = ConfigDict(value)
-        self._cfg_dict.__setitem__(name, value)
+        self._cfg_dict.__setitem__(name, self._wrap(value))
 
-    def __iter__(self):\
+    def __iter__(self):
         return iter(self._cfg_dict)
-    
-    def _to_plain_dict(self, obj=None):
-        """
-        Recursively convert ConfigDict / dict / list into a pure Python dict/list
-        so that yaml.safe_dump doesn’t introduce any Addict-specific tags.
-        """
-        if obj is None:
-            obj = self._cfg_dict
 
-        if isinstance(obj, ConfigDict) or isinstance(obj, dict):
-            return {
-                key: self._to_plain_dict(val)
-                for key, val in obj.items()
-            }
-        elif isinstance(obj, list):
-            return [self._to_plain_dict(val) for val in obj]
-        else:
-            # primitive (str, int, float, bool, etc.) – yaml can handle it
-            return obj
+    def _to_plain_dict(self, obj=_MISSING, _visited=None):
+        """
+        Recursively convert ConfigDict / dict / list / tuple into plain Python
+        containers. Detect cycles explicitly to avoid infinite recursion.
+        """
+        if obj is _MISSING:
+            obj = self._cfg_dict
+            
+        if _visited is None:
+            _visited = set()
+
+        if isinstance(obj, (ConfigDict, dict, list, tuple)):
+            obj_id = id(obj)
+            if obj_id in _visited:
+                raise ValueError(
+                    "Cyclic reference detected while converting config to a plain dict. "
+                    "Some non-config object may have been inserted into cfg."
+                )
+            _visited.add(obj_id)
+
+            try:
+                if isinstance(obj, (ConfigDict, dict)):
+                    return {
+                        key: self._to_plain_dict(val, _visited)
+                        for key, val in obj.items()
+                    }
+                elif isinstance(obj, list):
+                    return [self._to_plain_dict(val, _visited) for val in obj]
+                elif isinstance(obj, tuple):
+                    return tuple(self._to_plain_dict(val, _visited) for val in obj)
+            finally:
+                _visited.remove(obj_id)
+
+        return obj
 
     def to_dict(self):
-        """Return the full config as a nested plain `dict`."""
         return self._to_plain_dict()
 
     def save_config(self, filename):
-        """
-        Save the current configuration (including any programmatic overrides)
-        to `filename` in YAML format.
-        """
-        # ensure directory exists
         dirname = osp.dirname(filename)
         if dirname and not osp.exists(dirname):
             os.makedirs(dirname, exist_ok=True)
 
-        # convert to pure-Python dict
         cfg_dict = self.to_dict()
 
-        # dump as YAML
         with open(filename, 'w') as f:
-            yaml.safe_dump(cfg_dict, f, default_flow_style=False)
-
+            yaml.safe_dump(
+                cfg_dict,
+                f,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True
+            )
