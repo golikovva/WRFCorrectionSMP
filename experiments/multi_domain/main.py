@@ -110,6 +110,20 @@ def _allocate_pipeline_run_dir(logs_folder, model_name, experiment_name=None):
     return run_dir
 
 
+def _looks_like_checkpoint_path(value):
+    if not isinstance(value, (str, os.PathLike)):
+        return False
+
+    path = os.fspath(value)
+    suffix = os.path.splitext(path)[1].lower()
+    return (
+        os.path.isabs(path)
+        or '/' in path
+        or '\\' in path
+        or suffix in {'.pt', '.pth', '.ckpt', '.bin'}
+    )
+
+
 def _resolve_init_weights(stage_cfg, finished_stages):
     init_from = stage_cfg.get('init_weights_from', None)
 
@@ -122,13 +136,18 @@ def _resolve_init_weights(stage_cfg, finished_stages):
         last_stage_name = list(finished_stages.keys())[-1]
         return finished_stages[last_stage_name]['best_model_path']
 
+    if init_from in finished_stages:
+        return finished_stages[init_from]['best_model_path']
+
+    if _looks_like_checkpoint_path(init_from):
+        return os.fspath(init_from)
+
     if init_from not in finished_stages:
         raise KeyError(
             f"Stage {stage_cfg.get('name')} wants init_weights_from={init_from!r}, "
-            f"but finished stages are only: {list(finished_stages.keys())}"
+            f"but finished stages are only: {list(finished_stages.keys())}. "
+            "Use a stage name, 'previous', 'none', or a checkpoint path."
         )
-
-    return finished_stages[init_from]['best_model_path']
 
 
 def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
@@ -208,6 +227,7 @@ def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
         stage_result['stage_dir'] = stage_dir
         stage_result['resolved_config_path'] = resolved_stage_cfg_path
         stage_result['init_weights_from'] = stage.get('init_weights_from', None)
+        stage_result['resolved_init_weights_path'] = init_weights
 
         finished_stages[stage_name] = stage_result
         summary['stages'].append(stage_result)
