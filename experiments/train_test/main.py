@@ -30,15 +30,38 @@ from lib.data.datasets import (
 )
 from lib.data.scaler import StandardScaler
 from lib.pipeline.test import test
-from lib.pipeline.train import train
+from lib.pipeline.train import TRAINING_STATE_FILENAME, load_training_state, train
 from lib.models.build_module import build_correction_model
 from lib.data.logger import WRFLogger
 from lib.helpers.interpolation import InvDistTree
+from lib.distributed import (
+    distributed_is_initialized,
+    is_main_process,
+    load_model_state_dict,
+    local_device,
+    prepare_file_signal,
+    signal_file,
+    setup_distributed,
+    wait_for_file_signal,
+    wrap_model,
+)
 
+
+import random
 
 def _normalize_region(region_name):
     return str(region_name).strip().lower()
 
+
+def seed_everything(seed):
+    """Seed Python, NumPy and PyTorch RNGs when a global seed is configured."""
+    if seed is None:
+        return
+
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 def main(
     cfg,
@@ -49,7 +72,17 @@ def main(
     save_metadata=True,
     baselines_only=False,
     save_dir=None,
+    resume_training=False,
+    training_state_path=None,
 ):
+    setup_distributed()
+    resolved_device = local_device(getattr(cfg, 'device', None))
+    cfg.device = str(resolved_device)
+    global_seed = getattr(cfg, 'seed', None)
+    seed_everything(global_seed)
+    if global_seed is not None:
+        print(f"Global random seed: {int(global_seed)}")
+
     if folder_name is None:
         if cfg.run_config.run_mode == 'test' and results is not None and baselines_only:
             folder_name = 'model_comparison'
@@ -63,11 +96,11 @@ def main(
     print(logger.model_save_dir, 'model save dir')
 
     config_used_path = os.path.join(logger.save_dir, "config_used.yaml")
-    if cfg.run_config.run_mode != 'test' or save_dir is not None or not os.path.exists(config_used_path):
+    if is_main_process() and (cfg.run_config.run_mode != 'test' or save_dir is not None or not os.path.exists(config_used_path)):
         print('Saving config to', config_used_path)
         cfg.save_config(config_used_path)
 
-    cfg.device = torch.device(cfg.device)
+    cfg.device = resolved_device
     print(f"Running on {cfg.device} device")
 
     betas = [cfg.betas.beta_era, cfg.betas.beta_ms, cfg.betas.beta_st, cfg.betas.beta_sc]
@@ -95,7 +128,7 @@ def main(
     )
 
     era_dataset_uv = ERAMonthlyDataset(
-        os.path.join(cfg.data.era_folder, 'w10'),
+        os.path.join(cfg.data.era_folder, 'uv10m'),
         ['u10', 'v10'],
         seq_len=max_sl,
         region_bbox=[55, 90, -180, 180],
@@ -127,8 +160,18 @@ def main(
     train_days, val_days, test_days = split_dates_dispatch(**cfg.split_config)
     test_days = test_days[::max_sl]
 
-    train_sampler = Sampler(train_days, shuffle=True)
-    val_sampler = Sampler(val_days, shuffle=False)
+    train_sampler = Sampler(
+        train_days,
+        shuffle=True,
+        distributed=distributed_is_initialized(),
+        seed=int(global_seed or 0),
+    )
+    val_sampler = Sampler(
+        val_days,
+        shuffle=False,
+        distributed=distributed_is_initialized(),
+        pad=False,
+    )
     test_sampler = Sampler(test_days, shuffle=False)
     collate_fn = variable_len_collate if cfg.run_config.variable_sequence_length else variable_len_collate
 
@@ -151,7 +194,6 @@ def main(
 
     if cfg.test_config.use_stations and not cfg.run_config.use_stations:
         pipeline_datasets.append(st_ds)
-        print(pipeline_datasets)
         dataset = dataset_with_indices(DictDataset)(*pipeline_datasets)
     print(pipeline_datasets)
 
@@ -189,7 +231,8 @@ def main(
         torch.tensor([stds_dict[x] for x in wrf_keys]).float().to(cfg.device),
     )
 
-    print(wrf_scaler.means, wrf_scaler.stddevs)
+    print('means:', wrf_scaler.means)
+    print('stddevs:', wrf_scaler.stddevs)
 
     wrf_grid, era_grid = wrf_dataset.src_grid, era_dataset.src_grid
     era_coords = np.stack([era_grid['longitude'].flatten(), era_grid['latitude'].flatten()]).T
@@ -197,13 +240,13 @@ def main(
 
     scat_grid = sc_ds.src_grid
     scat_coords = np.stack([scat_grid['longitude'].flatten(), scat_grid['latitude'].flatten()]).T
-
+    print('file changed')
     meaner = ClusterMapper(
         mapping_file=None,
         target_coords=era_coords,
         input_coords=wrf_coords,
         weighted=cfg.run_config.weighted_meaner,
-        save_mapping=True,
+        save_mapping=cfg.run_config.save_mapping,
         save_name='meaner_mapping.npy',
         device=cfg.device,
         distance_metric='euclidean',
@@ -221,6 +264,8 @@ def main(
         kernel_type=cfg.loss_config.loss_kernel,
         k=cfg.loss_config.k,
         device=cfg.device,
+        era_loss=getattr(cfg.loss_config, 'era_loss', 'mse'),
+        scatter_loss=getattr(cfg.loss_config, 'scatter_loss', 'mse'),
     ).to(cfg.device).float()
 
     model = build_correction_model(cfg, grid=wrf_grid)
@@ -228,7 +273,14 @@ def main(
     if pretrained_weights is not None:
         print('Loading pretrained weights from', pretrained_weights)
         state_dict = torch.load(pretrained_weights, map_location=cfg.device)
-        model.load_state_dict(state_dict)
+        load_model_state_dict(model, state_dict)
+
+    if cfg.compile_model:
+        model = torch.compile(
+            model,
+            fullgraph=True,
+            dynamic=False,
+        )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.train.lr, weight_decay=1e-5)
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[10, 15], gamma=0.2)
@@ -237,6 +289,32 @@ def main(
 
     run_mode = str(cfg.run_config.run_mode).lower()
     trained_this_run = 'train' in run_mode
+    start_epoch = 0
+    resumed_training = False
+    if training_state_path is None:
+        training_state_path = os.path.join(logger.model_save_dir, TRAINING_STATE_FILENAME)
+
+    if trained_this_run and resume_training:
+        if os.path.exists(training_state_path):
+            print('Loading training state from', training_state_path)
+            training_state = load_training_state(
+                training_state_path,
+                model,
+                optimizer,
+                scheduler,
+                logger,
+                map_location=cfg.device,
+            )
+            start_epoch = int(training_state.get('next_epoch', 0))
+            if training_state.get('best_epoch') is not None:
+                best_epoch = int(training_state['best_epoch'])
+            resumed_training = True
+            print(f"Resuming training from epoch {start_epoch}")
+        else:
+            print('No training state found at', training_state_path)
+
+    if trained_this_run:
+        model = wrap_model(model, cfg.device)
 
     if trained_this_run:
         print(f"Started training the model: run no {logger.experiment_number}")
@@ -251,6 +329,9 @@ def main(
             scheduler,
             logger,
             cfg,
+            start_epoch=start_epoch,
+            checkpoint_path=training_state_path,
+            best_epoch=best_epoch,
         )
 
     if trained_this_run:
@@ -269,6 +350,24 @@ def main(
             'model_path': best_model_path,
         }
 
+    test_complete_path = os.path.join(logger.save_dir, '.test_complete')
+    test_result_path = os.path.join(logger.save_dir, '.test_result.yaml')
+    if distributed_is_initialized():
+        prepare_file_signal(test_complete_path)
+
+    if distributed_is_initialized() and not is_main_process():
+        # The process must stay alive for a possible next multi-domain stage,
+        # but it does not need to hold the trained model or wait in NCCL while
+        # rank 0 performs a long single-GPU test.
+        del model, optimizer, scheduler, criterion, meaner
+        del stations_interpolator, scat_interpolator, wrf_scaler, era_scaler
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        wait_for_file_signal(test_complete_path)
+        with open(test_result_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+
     models = {}
     for model_name in results:
         model_cfg = Config.fromfile(results[model_name]['path'])
@@ -276,7 +375,7 @@ def main(
 
         loaded_model = build_correction_model(model_cfg, grid=wrf_grid)
         state_dict = torch.load(results[model_name]['model_path'], map_location=model_cfg['device'])
-        loaded_model.load_state_dict(state_dict)
+        load_model_state_dict(loaded_model, state_dict)
         loaded_model.eval()
         models[model_name] = loaded_model
 
@@ -300,6 +399,9 @@ def main(
         'best_model_path': best_model_path,
         'evaluated_model_path': best_model_path,
         'pretrained_weights': pretrained_weights,
+        'training_state_path': training_state_path if trained_this_run else None,
+        'resumed_training': resumed_training,
+        'start_epoch': start_epoch if trained_this_run else None,
     }
 
     if save_metadata:
@@ -308,6 +410,14 @@ def main(
             yaml.safe_dump(run_metadata, f, sort_keys=False, allow_unicode=True)
         print('Saved run metadata to', metadata_path)
 
+    if distributed_is_initialized():
+        # This filesystem signal deliberately replaces a collective: rendering
+        # test plots can exceed NCCL's default ten-minute timeout.
+        tmp_result_path = f"{test_result_path}.tmp"
+        with open(tmp_result_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(run_metadata, f, sort_keys=False, allow_unicode=True)
+        os.replace(tmp_result_path, test_result_path)
+        signal_file(test_complete_path)
     return run_metadata
 
 class ConfigOverride:
@@ -357,6 +467,10 @@ if __name__ == '__main__':
                         help='Stage name for processing')
     parser.add_argument('--save_dir', type=str, default=None,
                         help='Explicit output directory. When set, no misc_N folder is created.')
+    parser.add_argument('--resume_training', action='store_true', default=False,
+                        help='Resume training from a saved training state if it exists.')
+    parser.add_argument('--training_state_path', type=str, default=None,
+                        help='Explicit path to the training state checkpoint.')
     parser.add_argument('--save_metadata', action='store_true', default=True,
                         help='Whether to save metadata (use --no-save_metadata to disable)')
     parser.add_argument('--no-save_metadata', action='store_false', dest='save_metadata',
@@ -401,5 +515,7 @@ if __name__ == '__main__':
         'save_metadata': args.save_metadata,
         'baselines_only': args.baselines_only,
         'save_dir': args.save_dir,
+        'resume_training': args.resume_training,
+        'training_state_path': args.training_state_path,
     }
     main(**main_kwargs)

@@ -3,6 +3,7 @@ import sys
 import copy
 import yaml
 import re
+import argparse
 import importlib.util
 from collections.abc import Mapping
 
@@ -12,6 +13,12 @@ sys.path.insert(0, '/home')
 sys.path.insert(0, '../../')
 
 from lib.config.cfg import Config
+from lib.distributed import (
+    barrier,
+    broadcast_object,
+    is_main_process,
+    setup_distributed,
+)
 
 
 _MISC_DIR_RE = re.compile(r'^misc_(\d+)$')
@@ -110,6 +117,179 @@ def _allocate_pipeline_run_dir(logs_folder, model_name, experiment_name=None):
     return run_dir
 
 
+def _pipeline_run_dir(logs_folder, model_name, experiment_name=None):
+    return os.path.join(
+        logs_folder,
+        _sanitize_path_part(model_name),
+        _sanitize_path_part(experiment_name),
+    )
+
+
+def _resolve_pipeline_run_dir(
+    logs_folder,
+    model_name,
+    experiment_name=None,
+    *,
+    resume=False,
+    resume_dir=None,
+):
+    if not resume:
+        return _allocate_pipeline_run_dir(logs_folder, model_name, experiment_name)
+
+    if resume_dir not in (None, ''):
+        run_dir = os.fspath(resume_dir)
+    else:
+        if experiment_name in (None, ''):
+            raise ValueError("--resume requires --resume-dir when experiment_name is empty.")
+        run_dir = _pipeline_run_dir(logs_folder, model_name, experiment_name)
+
+    if not os.path.isdir(run_dir):
+        raise FileNotFoundError(
+            f"Cannot resume: pipeline run directory does not exist: {run_dir}"
+        )
+    return run_dir
+
+
+def _load_pipeline_summary(pipeline_dir):
+    summary_path = os.path.join(pipeline_dir, "pipeline_summary.yaml")
+    if not os.path.exists(summary_path):
+        return None
+    with open(summary_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _completed_stage_results(summary, configured_stages):
+    completed = []
+    for stage_idx, stage_result in enumerate(summary.get('stages', [])):
+        if stage_idx >= len(configured_stages):
+            raise ValueError(
+                "Cannot resume: pipeline_summary.yaml has more stages than the current config."
+            )
+
+        expected_name = configured_stages[stage_idx]['name']
+        actual_name = stage_result.get('stage_name')
+        if actual_name != expected_name:
+            raise ValueError(
+                f"Cannot resume: completed stage {stage_idx} is {actual_name!r}, "
+                f"but current config expects {expected_name!r}."
+            )
+        if 'best_model_path' not in stage_result:
+            raise ValueError(
+                f"Cannot resume: completed stage {actual_name!r} has no best_model_path."
+            )
+        completed.append(stage_result)
+    return completed
+
+
+def _has_stage_selector(value):
+    return value not in (None, '')
+
+
+def _validate_stage_rerun_options(*, only_stage=None, from_stage=None):
+    if _has_stage_selector(only_stage) and _has_stage_selector(from_stage):
+        raise ValueError("Use either --only-stage or --from-stage, not both.")
+
+
+def _resolve_resume_training(resume, resume_training=None):
+    if resume_training is None:
+        return bool(resume)
+    return bool(resume_training)
+
+
+def _resolve_stage_selector(selector, configured_stages):
+    if not _has_stage_selector(selector):
+        return None
+
+    selector_text = str(selector).strip()
+    try:
+        stage_idx = int(selector_text)
+    except ValueError:
+        matches = [
+            idx
+            for idx, stage in enumerate(configured_stages)
+            if stage['name'] == selector_text
+        ]
+        if not matches:
+            available = ', '.join(stage['name'] for stage in configured_stages)
+            raise ValueError(
+                f"Unknown stage selector {selector!r}. "
+                f"Use a zero-based stage index or one of: {available}."
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"Stage selector {selector!r} matches multiple stages. "
+                "Use a zero-based stage index instead."
+            )
+        return matches[0]
+
+    if stage_idx < 0 or stage_idx >= len(configured_stages):
+        raise ValueError(
+            f"Stage index {stage_idx} is out of range. "
+            f"Valid indexes are 0..{len(configured_stages) - 1}."
+        )
+    return stage_idx
+
+
+def _build_finished_stages(stage_results):
+    return {
+        stage_result['stage_name']: stage_result
+        for stage_result in stage_results
+    }
+
+
+def _require_completed_prefix(completed, stage_idx, option_name):
+    if stage_idx > len(completed):
+        raise ValueError(
+            f"{option_name} cannot start from stage {stage_idx}: "
+            f"pipeline_summary.yaml contains only {len(completed)} completed "
+            "stage(s) before the selected stage."
+        )
+
+
+def _prepare_resume_stage_results(
+    previous_summary,
+    configured_stages,
+    *,
+    only_stage_idx=None,
+    from_stage_idx=None,
+):
+    completed = _completed_stage_results(previous_summary, configured_stages)
+
+    if only_stage_idx is not None:
+        _require_completed_prefix(completed, only_stage_idx, "--only-stage")
+        return list(completed), completed[:only_stage_idx]
+
+    if from_stage_idx is not None:
+        _require_completed_prefix(completed, from_stage_idx, "--from-stage")
+        prefix = completed[:from_stage_idx]
+        return prefix, prefix
+
+    return completed, completed
+
+
+def _record_stage_result(summary, stage_idx, stage_result):
+    stages = summary.setdefault('stages', [])
+    if stage_idx < len(stages):
+        stages[stage_idx] = stage_result
+        return
+
+    if stage_idx == len(stages):
+        stages.append(stage_result)
+        return
+
+    raise ValueError(
+        f"Cannot record stage {stage_idx}: pipeline_summary.yaml has only "
+        f"{len(stages)} stage result(s)."
+    )
+
+
+def _write_pipeline_summary(summary, pipeline_dir):
+    summary_path = os.path.join(pipeline_dir, "pipeline_summary.yaml")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(summary, f, sort_keys=False, allow_unicode=True)
+    return summary_path
+
+
 def _looks_like_checkpoint_path(value):
     if not isinstance(value, (str, os.PathLike)):
         return False
@@ -150,9 +330,26 @@ def _resolve_init_weights(stage_cfg, finished_stages):
         )
 
 
-def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
+def run_pipeline(
+    multi_cfg_path="/home/configs/multi_domain.yaml",
+    *,
+    resume=False,
+    resume_dir=None,
+    only_stage=None,
+    from_stage=None,
+    resume_training=None,
+):
+    setup_distributed()
     pipeline_cfg = Config.fromfile(multi_cfg_path)
     single_stage_main, single_stage_path = _load_single_stage_main()
+    resume_training = _resolve_resume_training(resume, resume_training)
+
+    _validate_stage_rerun_options(only_stage=only_stage, from_stage=from_stage)
+    only_stage_idx = _resolve_stage_selector(only_stage, pipeline_cfg.stages)
+    from_stage_idx = _resolve_stage_selector(from_stage, pipeline_cfg.stages)
+    selected_start_idx = only_stage_idx
+    if selected_start_idx is None:
+        selected_start_idx = from_stage_idx
 
     base_config_path = pipeline_cfg.base_config_path
     base_cfg = Config.fromfile(base_config_path)
@@ -160,13 +357,27 @@ def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
     pipeline_logs_folder = pipeline_cfg.get('pipeline_logs_folder', base_cfg.data.logs_folder)
     model_name = pipeline_cfg.get('model_name', base_cfg.model_type)
 
-    pipeline_dir = _allocate_pipeline_run_dir(
-        pipeline_logs_folder,
-        model_name,
-        experiment_name,
-    )
+    pipeline_dir = None
+    if is_main_process():
+        pipeline_dir = _resolve_pipeline_run_dir(
+            pipeline_logs_folder,
+            model_name,
+            experiment_name,
+            resume=resume,
+            resume_dir=resume_dir,
+        )
+    pipeline_dir = broadcast_object(pipeline_dir, src=0)
+    pipeline_cfg_path = os.path.join(
+            pipeline_dir,
+            f"pipeline_config_used.yaml"
+        )
+    if is_main_process() and not (resume and os.path.exists(pipeline_cfg_path)):
+        pipeline_cfg.save_config(pipeline_cfg_path)
+
     resolved_configs_dir = os.path.join(pipeline_dir, "resolved_configs")
-    os.makedirs(resolved_configs_dir, exist_ok=True)
+    if is_main_process():
+        os.makedirs(resolved_configs_dir, exist_ok=True)
+    barrier()
 
     summary = {
         'experiment_name': experiment_name,
@@ -181,9 +392,87 @@ def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
     }
 
     finished_stages = {}
+    completed_stage_count = 0
+    if resume:
+        previous_summary = _load_pipeline_summary(pipeline_dir)
+        if previous_summary is not None:
+            summary_stages, dependency_stages = _prepare_resume_stage_results(
+                previous_summary,
+                pipeline_cfg.stages,
+                only_stage_idx=only_stage_idx,
+                from_stage_idx=from_stage_idx,
+            )
+            summary.update(previous_summary)
+            summary.update({
+                'experiment_name': experiment_name,
+                'model_name': model_name,
+                'multi_config_path': multi_cfg_path,
+                'base_config_path': base_config_path,
+                'save_dir': pipeline_dir,
+                'resolved_configs_dir': resolved_configs_dir,
+                'single_stage_trainer_path': single_stage_path,
+            })
+            summary['stages'] = summary_stages
+            finished_stages = _build_finished_stages(dependency_stages)
+            if only_stage_idx is None and from_stage_idx is None:
+                completed_stage_count = len(summary_stages)
+            elif from_stage_idx is not None:
+                completed_stage_count = from_stage_idx
+            print(f"Resuming pipeline from {pipeline_dir}")
+            if only_stage_idx is not None:
+                print(
+                    f"Rerunning only stage {only_stage_idx}: "
+                    f"{pipeline_cfg.stages[only_stage_idx]['name']}"
+                )
+            elif from_stage_idx is not None:
+                discarded_count = (
+                    len(previous_summary.get('stages', [])) - len(summary_stages)
+                )
+                print(
+                    f"Rerunning from stage {from_stage_idx}: "
+                    f"{pipeline_cfg.stages[from_stage_idx]['name']}"
+                )
+                if discarded_count > 0:
+                    print(f"Replacing {discarded_count} previous stage result(s).")
+            else:
+                print(f"Skipping {completed_stage_count} completed stage(s).")
+        else:
+            if selected_start_idx not in (None, 0):
+                raise ValueError(
+                    "Cannot skip earlier stages without pipeline_summary.yaml. "
+                    "Run without a stage selector, start from stage 0, or provide a "
+                    "resume directory with completed prerequisite stages."
+                )
+            print(f"Resuming pipeline from {pipeline_dir}; no summary found yet.")
+    elif selected_start_idx not in (None, 0):
+        raise ValueError(
+            "--only-stage/--from-stage can skip earlier stages only with --resume, "
+            "so prerequisite stage results can be loaded from pipeline_summary.yaml."
+        )
 
     for stage_idx, stage in enumerate(pipeline_cfg.stages):
         stage_name = stage['name']
+        if only_stage_idx is not None and stage_idx != only_stage_idx:
+            print(
+                "Skipping stage outside --only-stage selection "
+                f"{stage_idx + 1}/{len(pipeline_cfg.stages)}: {stage_name}"
+            )
+            continue
+
+        if from_stage_idx is not None and stage_idx < from_stage_idx:
+            print(
+                "Skipping stage before --from-stage selection "
+                f"{stage_idx + 1}/{len(pipeline_cfg.stages)}: {stage_name}"
+            )
+            continue
+
+        if only_stage_idx is None and from_stage_idx is None and stage_idx < completed_stage_count:
+            print(
+                "Skipping completed stage "
+                f"{stage_idx + 1}/{len(pipeline_cfg.stages)}: {stage_name}"
+            )
+            continue
+
         print(f"\n{'=' * 80}")
         print(f"Running stage {stage_idx + 1}/{len(pipeline_cfg.stages)}: {stage_name}")
         print(f"{'=' * 80}\n")
@@ -204,7 +493,9 @@ def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
             resolved_configs_dir,
             f"stage_{stage_idx:02d}_{_sanitize_path_part(stage_name)}.yaml"
         )
-        stage_base_cfg.save_config(resolved_stage_cfg_path)
+        if is_main_process():
+            stage_base_cfg.save_config(resolved_stage_cfg_path)
+        barrier()
 
         stage_dir = os.path.join(
             pipeline_dir,
@@ -219,6 +510,7 @@ def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
             save_metadata=True,
             baselines_only=False,
             save_dir=stage_dir,
+            resume_training=resume_training,
         )
 
         stage_result = _to_serializable(stage_result)
@@ -230,11 +522,11 @@ def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
         stage_result['resolved_init_weights_path'] = init_weights
 
         finished_stages[stage_name] = stage_result
-        summary['stages'].append(stage_result)
+        _record_stage_result(summary, stage_idx, stage_result)
 
-        summary_path = os.path.join(pipeline_dir, "pipeline_summary.yaml")
-        with open(summary_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(summary, f, sort_keys=False, allow_unicode=True)
+        if is_main_process():
+            _write_pipeline_summary(summary, pipeline_dir)
+        barrier()
 
         print(f"Stage {stage_name} finished.")
         print(f"Best model: {stage_result['best_model_path']}")
@@ -245,6 +537,52 @@ def run_pipeline(multi_cfg_path="/home/configs/multi_domain.yaml"):
 
 
 if __name__ == "__main__":
-    cfg_path = sys.argv[1] if len(sys.argv) > 1 else "/home/configs/multi_domain.yaml"
-    summary = run_pipeline(cfg_path)
+    parser = argparse.ArgumentParser(description="Run a multi-domain training/testing pipeline.")
+    parser.add_argument(
+        "cfg_path",
+        nargs="?",
+        default="/home/configs/multi_domain.yaml",
+        help="Path to the multi-domain YAML config.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing pipeline run and continue interrupted training stages.",
+    )
+    parser.add_argument(
+        "--resume-dir",
+        default=None,
+        help="Existing pipeline run directory to resume. Required for anonymous runs.",
+    )
+    parser.add_argument(
+        "--only-stage",
+        default=None,
+        help="Run exactly one configured stage by zero-based index or exact stage name.",
+    )
+    parser.add_argument(
+        "--from-stage",
+        default=None,
+        help=(
+            "Run the selected configured stage and every later stage by "
+            "zero-based index or exact stage name."
+        ),
+    )
+    parser.add_argument(
+        "--no-resume-training",
+        action="store_true",
+        help=(
+            "Do not load stage training_state.pth when --resume is used. "
+            "The pipeline run is still resumed for summary/dependency context."
+        ),
+    )
+    args = parser.parse_args()
+
+    summary = run_pipeline(
+        args.cfg_path,
+        resume=args.resume,
+        resume_dir=args.resume_dir,
+        only_stage=args.only_stage,
+        from_stage=args.from_stage,
+        resume_training=False if args.no_resume_training else None,
+    )
     print(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True))

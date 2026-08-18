@@ -44,7 +44,7 @@ class NCs2sDataset(Dataset):
         super().__init__()
         self.path = Path(data_folder)
         self.dates_dict = self._create_dates_dict()
-        self.data_variables = data_variables
+        self.data_variables = self._normalize_variables(data_variables)
 
         self.src_grid = self._create_grid()
         self.lat_slice = slice(None)
@@ -57,6 +57,26 @@ class NCs2sDataset(Dataset):
         self.time_res_h = time_resolution_h
         self.add_coords = add_coords
         self.add_time_encoding = add_time_encoding
+
+    @staticmethod
+    def _normalize_variables(variables):
+        if variables is None:
+            return []
+        if isinstance(variables, str):
+            return [variables]
+        return list(variables)
+
+    def _empty_file_vars(self, filename, times):
+        if times is wrf.ALL_TIMES:
+            with netCDF4.Dataset(filename, 'r') as ncf:
+                time_dim = ncf.dimensions.get('Time')
+                time_len = len(time_dim) if time_dim is not None else 1
+        else:
+            selected_times = np.asarray(times)
+            time_len = int(selected_times.size) if selected_times.ndim > 0 else 1
+
+        h, w = self.src_grid['latitude'].shape
+        return np.empty((time_len, 0, h, w), dtype=np.float32)
 
     def _create_dates_dict(self):
         result = {}
@@ -89,7 +109,10 @@ class NCs2sDataset(Dataset):
         raise NotImplementedError
 
     def load_file_vars(self, filename, variables, times=None):
+        variables = self._normalize_variables(variables)
         times = wrf.ALL_TIMES if times is None else times
+        if not variables:
+            return self._empty_file_vars(filename, times)
         npy = []
         var_slice = np.s_[..., self.lat_slice, self.lon_slice]
         with netCDF4.Dataset(filename, 'r') as ncf:
@@ -135,18 +158,20 @@ class NCs2sDataset(Dataset):
         # print(data)
         if data[0] is None:
             return None
+        sample_len = data[0].shape[0]
         add_coords = self.add_coords if add_coords is None else add_coords
         add_time_encoding = self.add_time_encoding if add_time_encoding is None else add_time_encoding
         if add_coords:
-            data.append(np.broadcast_to(np.stack([self.src_grid['latitude'], self.src_grid['longitude']]), [self.seq_len, 2, *data[0].shape[-2:]]))
-        if self.add_time_encoding:
-            day_encoded, hour_encoded = self.get_day_hour_encoding(date)
+            data.append(np.broadcast_to(g := np.stack([self.src_grid['latitude'], self.src_grid['longitude']]), [sample_len, 2, *g.shape[-2:]]))
+        if add_time_encoding:
+            day_encoded, hour_encoded = self.get_day_hour_encoding(date, length=sample_len)
             data.extend([np.expand_dims(day_encoded, 1), np.expand_dims(hour_encoded, 1)])
         data = np.concatenate(data, axis=1)
         return data
     
-    def get_day_hour_encoding(self, date, frequency=1):
-        date_seq = np.arange(date, date + np.timedelta64(self.seq_len*self.time_res_h, 'h'), np.timedelta64(self.time_res_h, 'h'))
+    def get_day_hour_encoding(self, date, frequency=1, length=None):
+        seq_len = self.seq_len if length is None else length
+        date_seq = np.arange(date, date + np.timedelta64(seq_len*self.time_res_h, 'h'), np.timedelta64(self.time_res_h, 'h'))
         day = (date_seq.astype('datetime64[D]') - date_seq.astype('datetime64[Y]')).astype(int) / 365
         hour = (date_seq.astype('datetime64[h]') - date_seq.astype('datetime64[D]')).astype(int) / 24
         d1 = abs(abs(0.5 - day) - 0.5) + 0.05

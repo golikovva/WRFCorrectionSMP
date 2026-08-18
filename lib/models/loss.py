@@ -1,13 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from lib.helpers.metrics import LatitudeWeightedMSE
 from lib.models.model_parts import DeltaConvLayer
 
 
 class HeterogenousMSLoss(nn.Module):
     def __init__(self, meaner, betas, station_interpolator=None, scatter_interpolator=None, logger=None,
-                 kernel_type='gauss', channels=3, k=9, device='cpu'):
+                 kernel_type='gauss', channels=3, k=9, device='cpu',
+                 era_loss='mse', scatter_loss='mse'):
         super().__init__()
+        self.era_loss_name = self._validate_grid_loss_name(era_loss, "era_loss")
+        self.scatter_loss_name = self._validate_grid_loss_name(scatter_loss, "scatter_loss")
         self.mean_mse = nn.MSELoss()
         self.delta_mse = nn.MSELoss()
         self.station_mse = nn.MSELoss(reduction='none')
@@ -15,21 +19,76 @@ class HeterogenousMSLoss(nn.Module):
         self.delta_conv = DeltaConvLayer(channels=channels, k=k, kernel_type=kernel_type).to(device)
         self.station_interpolator = station_interpolator
         self.scatter_interpolator = scatter_interpolator
-        if scatter_interpolator:
-            self.wrf_mask = scatter_interpolator.calc_input_tensor_mask([132, 430], fill_value=0)
+        self.wrf_mask = None
         self.meaner = meaner
         self.betas = betas
         self.betas[2] = torch.tensor(self.betas[2], device=device)
+        self.era_lat_weighted_mse = None
+        self.scatter_lat_weighted_mse = None
+
+        if self.era_loss_name == 'lat_weighted_mse':
+            self.era_lat_weighted_mse = LatitudeWeightedMSE(
+                self._meaner_target_latitudes(meaner),
+                reduction='mean',
+                spatial_ndim=1,
+            ).to(device)
+
+        if self.scatter_loss_name == 'lat_weighted_mse' and scatter_interpolator is not None:
+            self.scatter_lat_weighted_mse = LatitudeWeightedMSE(
+                self._interpolator_target_latitudes(scatter_interpolator),
+                reduction='mean',
+                spatial_ndim=2,
+            ).to(device)
 
         if logger:
             logger.set_beta(betas)
+
+    @staticmethod
+    def _validate_grid_loss_name(loss_name, field_name):
+        if loss_name not in {'mse', 'lat_weighted_mse'}:
+            raise ValueError(f"Unsupported {field_name}={loss_name!r}. Expected 'mse' or 'lat_weighted_mse'.")
+        return loss_name
+
+    @staticmethod
+    def _meaner_target_latitudes(meaner):
+        if not hasattr(meaner, 'target_coords'):
+            raise ValueError("meaner must expose target_coords for latitude weighted ERA loss.")
+        target_coords = torch.as_tensor(meaner.target_coords, dtype=torch.float32)
+        if target_coords.ndim != 2 or target_coords.shape[-1] < 2:
+            raise ValueError("meaner.target_coords must have shape (N, >=2) with latitude in column 1.")
+        if hasattr(meaner, 'target_slice'):
+            target_slice = torch.as_tensor(meaner.target_slice, dtype=torch.long)
+            return target_coords[target_slice, 1]
+        if hasattr(meaner, 'mask') and meaner.mask is not None:
+            mask = torch.as_tensor(meaner.mask, dtype=torch.bool)
+            return target_coords[mask, 1]
+        return target_coords[:, 1]
+
+    @staticmethod
+    def _interpolator_target_latitudes(interpolator):
+        if not hasattr(interpolator, 'q'):
+            raise ValueError("scatter_interpolator must expose q coordinates for latitude weighted scatter loss.")
+        target_coords = torch.as_tensor(interpolator.q, dtype=torch.float32)
+        if target_coords.ndim != 2 or target_coords.shape[-1] < 2:
+            raise ValueError("scatter_interpolator.q must have shape (N, >=2) with latitude in column 1.")
+        return target_coords[:, 1]
+
+    def _scatter_input_mask(self, shape):
+        if self.scatter_interpolator is None:
+            return None
+        if self.wrf_mask is None or tuple(self.wrf_mask.shape) != tuple(shape):
+            self.wrf_mask = self.scatter_interpolator.calc_input_tensor_mask(shape, fill_value=0)
+        return self.wrf_mask
 
     def forward(self, orig, corr, target=None, stations=None, scatter=None, scatter_times=None, orig_dates=None, logger=None, expanded_out=False):
         device = orig.device
         mse1 = torch.tensor(0., device=device, requires_grad=True)
         if target is not None and self.betas[0] > 0:
             mean_corr = self.mean_input_to_target(corr)
-            mse1 = self.mean_mse(mean_corr, target)
+            if self.era_loss_name == 'lat_weighted_mse':
+                mse1 = self.era_lat_weighted_mse(mean_corr, target)
+            else:
+                mse1 = self.mean_mse(mean_corr, target)
 
         delta_corr = corr - self.delta_conv(corr.view(-1, *corr.shape[-3:])).view(corr.shape)
         delta_orig = orig - self.delta_conv(orig.view(-1, *corr.shape[-3:])).view(orig.shape)
@@ -53,12 +112,21 @@ class HeterogenousMSLoss(nn.Module):
             # interpolate nwp in time
             corr_on_scat_grid = interp_nwp_in_time(corr_on_scat_grid, scatter_times, orig_dates)
             # filter NaNs
-            mask = (torch.isfinite(corr_on_scat_grid)) & (torch.isfinite(scatter) & torch.isfinite(self.wrf_mask))
+            wrf_mask = self._scatter_input_mask(scatter.shape[-2:])
+            mask = (torch.isfinite(corr_on_scat_grid)) & (torch.isfinite(scatter) & torch.isfinite(wrf_mask))
 
-            corr_on_scat_grid = corr_on_scat_grid[mask]     # 1D tensor of only the finite entries
-            scatter = scatter[mask]
-            if corr_on_scat_grid.numel() > 0 and scatter.numel() > 0:
-                mse4 = F.mse_loss(corr_on_scat_grid, scatter, reduction='mean')
+            if self.scatter_loss_name == 'lat_weighted_mse':
+                if self.scatter_lat_weighted_mse is None:
+                    raise ValueError("scatter_loss='lat_weighted_mse' requires scatter_interpolator.")
+                corr_on_scat_grid = torch.where(mask, corr_on_scat_grid, torch.full_like(corr_on_scat_grid, float('nan')))
+                scatter = torch.where(mask, scatter, torch.full_like(scatter, float('nan')))
+                weighted_mse = self.scatter_lat_weighted_mse(corr_on_scat_grid, scatter)
+                mse4 = torch.where(torch.isfinite(weighted_mse), weighted_mse, torch.zeros_like(weighted_mse))
+            else:
+                corr_on_scat_grid = corr_on_scat_grid[mask]     # 1D tensor of only the finite entries
+                scatter = scatter[mask]
+                if corr_on_scat_grid.numel() > 0 and scatter.numel() > 0:
+                    mse4 = F.mse_loss(corr_on_scat_grid, scatter, reduction='mean')
 
         total_mse = self.betas[0] * mse1 + self.betas[1] * mse2 + self.betas[2] * mse3 \
                     + self.betas[3] * mse4

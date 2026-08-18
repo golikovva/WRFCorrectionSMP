@@ -178,12 +178,12 @@ def split_given_dates_by_years(dates, valid_years=None, test_years=None):
     return train, val, test
 
 
-def parse_timedelta64(value, default_unit='D'):
+def parse_timedelta64(value, default_unit='D') -> np.timedelta64:
     """
     Convert a duration to ``np.timedelta64``.
 
     Accepts numpy timedeltas, integers with a default unit, or strings like
-    ``'7D'``, ``'90D'``, ``'12h'``.
+    ``'D'``, ``'7D'``, ``'M'``, ``'12h'``.
     """
     if isinstance(value, np.timedelta64):
         return value
@@ -192,13 +192,287 @@ def parse_timedelta64(value, default_unit='D'):
         return np.timedelta64(int(value), default_unit)
 
     if isinstance(value, str):
-        match = re.fullmatch(r'\s*(\d+)\s*([A-Za-z]+)\s*', value)
+        match = re.fullmatch(r'\s*(\d*)\s*([A-Za-z]+)\s*', value)
         if match is None:
             raise ValueError(f"Cannot parse duration {value!r}. Expected strings like '7D' or '12h'.")
         amount, unit = match.groups()
-        return np.timedelta64(int(amount), unit)
+        unit = {'d': 'D', 'w': 'W', 'H': 'h'}.get(unit, unit)
+        amount = 1 if amount == '' else int(amount)
+        try:
+            return np.timedelta64(amount, unit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Unsupported numpy timedelta unit in {value!r}.") from exc
 
     raise TypeError(f"Unsupported duration type: {type(value)}")
+
+
+def split_given_dates_by_test_years(dates, test_years):
+    """
+    Separate complete calendar years reserved for the final test.
+
+    This is a two-output convenience wrapper around
+    :func:`split_given_dates_by_years`. Input order and datetime64 resolution
+    are preserved.
+
+    Parameters
+    ----------
+    dates : array-like of datetime-like
+        Existing date list / array.
+    test_years : array-like of int or datetime64
+        Calendar years assigned to the test subset.
+
+    Returns
+    -------
+    development_dates, test_dates : np.ndarray
+        Dates outside and inside ``test_years``, respectively.
+    """
+    development_dates, _, test_dates = split_given_dates_by_years(
+        dates,
+        valid_years=None,
+        test_years=test_years,
+    )
+    return development_dates, test_dates
+
+
+def sample_seasonally_balanced_nested_dates(
+    dates,
+    blocks_per_season,
+    block_size='7D',
+    seed=0,
+    require_complete_blocks=True,
+):
+    """
+    Sample one seasonally balanced level of a nested training set.
+
+    Dates are divided into meteorological seasons (DJF, MAM, JJA, SON), then
+    into calendar-aligned blocks within every season occurrence. Exactly
+    ``blocks_per_season`` blocks are selected from each season and returned as
+    one sorted datetime array.
+
+    Repeated calls with the same ``dates``, ``block_size`` and ``seed`` are
+    nested by construction: the result for ``k`` blocks per season is a subset
+    of the result for ``k + 1`` blocks per season.
+
+    Fixed-duration blocks (for example ``'h'``, ``'D'`` or ``'7D'``) are
+    anchored at the start of each meteorological season. ``'M'`` uses calendar
+    months rather than a fixed number of days. By default, partial blocks at
+    dataset, season, validation or embargo boundaries are excluded.
+
+    Parameters
+    ----------
+    dates : array-like of datetime-like
+        Candidate training dates. They may span multiple years.
+    blocks_per_season : int
+        Nesting level: number of blocks selected independently from each of
+        DJF, MAM, JJA and SON.
+    block_size : str, int or np.timedelta64
+        Block duration accepted by :func:`parse_timedelta64`, e.g. ``'h'``,
+        ``'D'``, ``'7D'`` or ``'M'``. Integer values mean days.
+    seed : int
+        Seed controlling a reproducible random ordering of blocks.
+    require_complete_blocks : bool
+        If True, only blocks containing the complete inferred time grid are
+        eligible. Set to False only when partially observed blocks are desired.
+
+    Returns
+    -------
+    np.ndarray
+        Sorted flat array containing dates from all four seasons.
+    """
+    if isinstance(blocks_per_season, (bool, np.bool_)) or not isinstance(
+        blocks_per_season, (int, np.integer)
+    ):
+        raise TypeError("blocks_per_season must be an integer.")
+    if blocks_per_season <= 0:
+        raise ValueError("blocks_per_season must be positive.")
+
+    dates = np.sort(_to_datetime64_array(dates))
+    block_delta = parse_timedelta64(block_size)
+    if np.isnat(block_delta):
+        raise ValueError("block_size must be a positive duration.")
+
+    block_unit = np.datetime_data(block_delta.dtype)[0]
+    block_amount = int(block_delta.astype(np.int64))
+    if block_amount <= 0:
+        raise ValueError("block_size must be a positive duration.")
+    if block_unit == 'Y':
+        raise ValueError("Year-sized blocks are not supported inside meteorological seasons.")
+
+    month_indices = dates.astype('datetime64[M]').astype(np.int64)
+    years = dates.astype('datetime64[Y]').astype(int) + 1970
+    months = month_indices % 12 + 1
+
+    season_ids = np.empty(dates.size, dtype=np.int8)
+    season_ids[np.isin(months, [12, 1, 2])] = 0
+    season_ids[np.isin(months, [3, 4, 5])] = 1
+    season_ids[np.isin(months, [6, 7, 8])] = 2
+    season_ids[np.isin(months, [9, 10, 11])] = 3
+
+    season_years = years + (months == 12)
+    season_start_months = np.array([12, 3, 6, 9], dtype=np.int8)[season_ids]
+    season_start_years = season_years - (season_ids == 0)
+    season_start_month_indices = (
+        (season_start_years - 1970) * 12 + season_start_months - 1
+    )
+
+    block_ns = None
+    if block_unit == 'M':
+        block_indices = (
+            (month_indices - season_start_month_indices) // block_amount
+        )
+    else:
+        try:
+            block_ns = int(block_delta.astype('timedelta64[ns]').astype(np.int64))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"block_size={block_size!r} cannot be represented as a fixed duration."
+            ) from exc
+        if block_ns <= 0:
+            raise ValueError("block_size is too small to represent in nanoseconds.")
+
+        date_ns = dates.astype('datetime64[ns]').astype(np.int64)
+        season_start_ns = season_start_month_indices.astype(
+            'datetime64[M]'
+        ).astype('datetime64[ns]').astype(np.int64)
+        block_indices = (date_ns - season_start_ns) // block_ns
+
+    block_keys = np.empty(
+        dates.size,
+        dtype=[
+            ('season', np.int8),
+            ('season_year', np.int64),
+            ('block', np.int64),
+        ],
+    )
+    block_keys['season'] = season_ids
+    block_keys['season_year'] = season_years
+    block_keys['block'] = block_indices
+    unique_keys, group_ids, group_counts = np.unique(
+        block_keys,
+        return_inverse=True,
+        return_counts=True,
+    )
+
+    eligible_groups = np.ones(len(unique_keys), dtype=bool)
+    if require_complete_blocks and len(unique_keys) > 0:
+        date_ns = dates.astype('datetime64[ns]').astype(np.int64)
+        try:
+            step_ns = int(
+                _infer_date_step(dates)
+                .astype('timedelta64[ns]')
+                .astype(np.int64)
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "Cannot infer a fixed timestamp cadence for completeness checks. "
+                "Pass require_complete_blocks=False to allow partial blocks."
+            ) from exc
+        if step_ns <= 0:
+            raise ValueError("Inferred date step must be positive.")
+
+        key_seasons = unique_keys['season']
+        key_season_years = unique_keys['season_year']
+        key_blocks = unique_keys['block']
+        key_start_months = np.array([12, 3, 6, 9], dtype=np.int8)[
+            key_seasons
+        ]
+        key_start_years = key_season_years - (key_seasons == 0)
+        key_season_start_months = (
+            (key_start_years - 1970) * 12 + key_start_months - 1
+        )
+        key_season_end_months = key_season_start_months + 3
+
+        if block_unit == 'M':
+            key_block_start_months = (
+                key_season_start_months + key_blocks * block_amount
+            )
+            key_block_end_months = key_block_start_months + block_amount
+            key_block_starts = key_block_start_months.astype(
+                'datetime64[M]'
+            ).astype('datetime64[ns]').astype(np.int64)
+            key_block_ends = key_block_end_months.astype(
+                'datetime64[M]'
+            ).astype('datetime64[ns]').astype(np.int64)
+            within_season = key_block_end_months <= key_season_end_months
+        else:
+            assert block_ns is not None
+            key_season_starts = key_season_start_months.astype(
+                'datetime64[M]'
+            ).astype('datetime64[ns]').astype(np.int64)
+            key_season_ends = key_season_end_months.astype(
+                'datetime64[M]'
+            ).astype('datetime64[ns]').astype(np.int64)
+            key_block_starts = key_season_starts + key_blocks * block_ns
+            key_block_ends = key_block_starts + block_ns
+            within_season = key_block_ends <= key_season_ends
+
+        durations = key_block_ends - key_block_starts
+        cadence_fits = durations % step_ns == 0
+        expected_counts = durations // step_ns
+
+        group_min_dates = np.full(
+            len(unique_keys),
+            np.iinfo(np.int64).max,
+            dtype=np.int64,
+        )
+        group_max_dates = np.full(
+            len(unique_keys),
+            np.iinfo(np.int64).min,
+            dtype=np.int64,
+        )
+        np.minimum.at(group_min_dates, group_ids, date_ns)
+        np.maximum.at(group_max_dates, group_ids, date_ns)
+
+        timestamp_offsets = date_ns - key_block_starts[group_ids]
+        misaligned_counts = np.bincount(
+            group_ids,
+            weights=(timestamp_offsets % step_ns != 0),
+            minlength=len(unique_keys),
+        )
+        eligible_groups = (
+            within_season
+            & cadence_fits
+            & (group_counts == expected_counts)
+            & (group_min_dates == key_block_starts)
+            & (group_max_dates == key_block_ends - step_ns)
+            & (misaligned_counts == 0)
+        )
+
+    season_names = ('DJF', 'MAM', 'JJA', 'SON')
+    rng = np.random.default_rng(seed)
+    selected_groups = np.zeros(len(unique_keys), dtype=bool)
+    available_counts = {}
+
+    for season_id, season_name in enumerate(season_names):
+        available_counts[season_name] = int(np.count_nonzero(
+            (unique_keys['season'] == season_id) & eligible_groups
+        ))
+
+    insufficient = {
+        name: count
+        for name, count in available_counts.items()
+        if count < blocks_per_season
+    }
+    if insufficient:
+        counts = ', '.join(
+            f"{name}={count}"
+            for name, count in available_counts.items()
+        )
+        raise ValueError(
+            f"Requested {blocks_per_season} blocks per season, but not "
+            f"enough blocks are available after completeness checks ({counts})."
+        )
+
+    for season_id in range(len(season_names)):
+        available_group_ids = np.flatnonzero(
+            (unique_keys['season'] == season_id) & eligible_groups
+        )
+        chosen_group_ids = available_group_ids[
+            rng.permutation(len(available_group_ids))[:blocks_per_season]
+        ]
+        selected_groups[chosen_group_ids] = True
+
+    return dates[selected_groups[group_ids]]
 
 
 def is_all_train_size(value):
@@ -409,6 +683,13 @@ def split_dates_dispatch(
     validation_end=None,
     valid_years=None,
     test_years=None,
+    blocks_per_season=None,
+    block_size='7D',
+    seed=0,
+    validation_blocks_per_season=None,
+    validation_block_size=None,
+    validation_seed=0,
+    require_complete_blocks=True,
 ):
     """
     Universal dispatcher for splitting an existing dates array.
@@ -421,6 +702,7 @@ def split_dates_dispatch(
           - 'percents'
           - 'dates'
           - 'years'
+          - 'seasonal_nested'
 
     Returns
     -------
@@ -464,8 +746,60 @@ def split_dates_dispatch(
             test_years=test_years,
         )
 
+    if mode in {
+        "seasonal_nested",
+        "nested_seasonal",
+        "seasonally_balanced_nested",
+    }:
+        if blocks_per_season is None:
+            raise ValueError(
+                "For split_mode='seasonal_nested', blocks_per_season must be provided."
+            )
+        if validation_blocks_per_season is None:
+            raise ValueError(
+                "For split_mode='seasonal_nested', "
+                "validation_blocks_per_season must be provided."
+            )
+        if _normalize_years(test_years).size == 0:
+            raise ValueError(
+                "For split_mode='seasonal_nested', test_years must be provided."
+            )
+        # if _normalize_years(valid_years).size > 0:
+        #     raise ValueError(
+        #         "split_mode='seasonal_nested' uses seasonal validation blocks; "
+        #         "valid_years must be empty."
+        #     )
+
+        development_dates, test_dates = split_given_dates_by_test_years(
+            dates,
+            test_years=test_years,
+        )
+        validation_dates = sample_seasonally_balanced_nested_dates(
+            development_dates,
+            blocks_per_season=validation_blocks_per_season,
+            block_size=(
+                block_size
+                if validation_block_size is None
+                else validation_block_size
+            ),
+            seed=validation_seed,
+            require_complete_blocks=require_complete_blocks,
+        )
+        train_pool = development_dates[
+            ~np.isin(development_dates, validation_dates)
+        ]
+        train_dates = sample_seasonally_balanced_nested_dates(
+            train_pool,
+            blocks_per_season=blocks_per_season,
+            block_size=block_size,
+            seed=seed,
+            require_complete_blocks=require_complete_blocks,
+        )
+        return train_dates, validation_dates, test_dates
+
     raise ValueError(
-        f"Unknown split_mode='{split_mode}'. Supported modes: 'percents', 'dates', 'years'."
+        f"Unknown split_mode='{split_mode}'. Supported modes: "
+        "'percents', 'dates', 'years', 'seasonal_nested'."
     )
 
 def arange_dates(start_date, end_date, time_step='1h'):

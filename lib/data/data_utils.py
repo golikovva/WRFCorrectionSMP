@@ -75,17 +75,42 @@ def find_files(directory, pattern):
 
 
 class Sampler:
-    def __init__(self, days, shuffle=False):
+    def __init__(self, days, shuffle=False, distributed=False, seed=0, pad=True):
         self.days = days
         self.shuffle = shuffle
+        self.distributed = distributed
+        self.seed = int(seed)
+        self.pad = pad
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
 
     def __len__(self):
+        if self.distributed:
+            from lib.distributed import rank, world_size
+            if self.pad:
+                return int(np.ceil(len(self.days) / world_size()))
+            replicas = world_size()
+            return max(0, (len(self.days) - rank() + replicas - 1) // replicas)
         return len(self.days)
 
     def __iter__(self):
         ids = np.arange(len(self.days))
         if self.shuffle:
-            np.random.shuffle(ids)
+            if self.distributed:
+                rng = np.random.default_rng(self.seed + self.epoch)
+                rng.shuffle(ids)
+            else:
+                np.random.shuffle(ids)
+        if self.distributed:
+            from lib.distributed import rank, world_size
+            replicas = world_size()
+            samples_per_rank = int(np.ceil(len(ids) / replicas))
+            total_size = samples_per_rank * replicas if self.pad else len(ids)
+            if self.pad and total_size > len(ids):
+                ids = np.concatenate([ids, np.resize(ids, total_size - len(ids))])
+            ids = ids[rank():total_size:replicas]
         for i in ids:
             yield self.days[i]
 

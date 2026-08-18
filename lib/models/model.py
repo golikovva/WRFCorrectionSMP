@@ -25,6 +25,39 @@ class Corrector(nn.Module):
             return o_input[0] + unet_out.view(x.shape[0], x.shape[1], 3, x.shape[3], x.shape[4])
 
 
+class InputChannelSelector(nn.Module):
+    def __init__(self, model, drop_first_channels=0):
+        super().__init__()
+        self.model = model
+        self.drop_first_channels = int(drop_first_channels)
+        if self.drop_first_channels < 0:
+            raise ValueError("drop_first_channels must be non-negative")
+        if hasattr(model, "requires_dates"):
+            self.requires_dates = model.requires_dates
+
+    def forward(self, x, *args, **kwargs):
+        return self.model(self.select_channels(x), *args, **kwargs)
+
+    def select_channels(self, x):
+        if isinstance(x, torch.nn.utils.rnn.PackedSequence):
+            data = self._select_dense(x.data)
+            return torch.nn.utils.rnn.PackedSequence(data, x.batch_sizes, x.sorted_indices, x.unsorted_indices)
+        return self._select_dense(x)
+
+    def _select_dense(self, x):
+        if self.drop_first_channels == 0:
+            return x
+        if x.ndim < 3:
+            raise ValueError(f"Expected tensor with channel dim -3, got {tuple(x.shape)}")
+
+        channels = x.shape[-3]
+        if self.drop_first_channels >= channels:
+            raise ValueError(
+                f"Cannot drop {self.drop_first_channels} channels from input with {channels} channels"
+            )
+        return x.narrow(dim=-3, start=self.drop_first_channels, length=channels - self.drop_first_channels)
+
+
 class LowFreqCorrector(nn.Module):
     def __init__(self, model, in_channels=8, out_channels=3, k=7, inference_mode=False):
         super().__init__()
