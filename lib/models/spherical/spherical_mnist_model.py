@@ -3,29 +3,26 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal
 
 import torch
 from torch import Tensor, nn
 
 from ...data.spherical.sphere_graph import SphereGraphGeometry
 from ...data.spherical.sphere_hierarchy import SphereGraphHierarchy, SpherePooler, SphereWeightedPooler
-from .steerable_layers import (
+from .irrep_layers import (
     IrrepBatchNorm,
     IrrepSphereConv,
     RegularNonlinearity,
-    ScalarToVectorSphereConv,
     SO2IrrepFieldType,
-    VectorNormReLU,
-    VectorToScalarSphereConv,
-    VectorToVectorSphereConv,
+    _IrrepConvGeometry,
     _flatten_irrep_block,
-    _graph_tensors,
     _irrep_block,
     _rotate_irrep_block,
 )
 
-_DEFAULT_VECTOR_CHANNELS = (8, 16, 16, 24, 24, 32, 64)
-_DEFAULT_VECTOR_STRIDES = (1, 2, 1, 2, 1, 2, 1)
+_DEFAULT_IRREP_CHANNELS = (8, 16, 16, 24, 24, 32, 64)
+_DEFAULT_IRREP_STRIDES = (1, 2, 1, 2, 1, 2, 1)
 _DEFAULT_FC_CHANNELS = (64, 32)
 
 
@@ -36,21 +33,6 @@ def _as_int_tuple(name: str, values: Sequence[int]) -> tuple[int, ...]:
     if any(value < 1 for value in result):
         raise ValueError(f"{name} values must be positive")
     return result
-
-
-def _make_scalar_self_mixing(
-    in_channels: int,
-    out_channels: int,
-    *,
-    identity_init: bool,
-) -> nn.Linear:
-    layer = nn.Linear(in_channels, out_channels, bias=False)
-    if identity_init:
-        nn.init.zeros_(layer.weight)
-        diag = min(int(in_channels), int(out_channels))
-        with torch.no_grad():
-            layer.weight[:diag, :diag].fill_(1.0)
-    return layer
 
 
 def _scatter_edge_chunks(
@@ -84,156 +66,6 @@ def _scatter_edge_chunks(
         norm_shape = (1, n_points, *([1] * len(trailing_shape)))
         out = out / neighbor_count.clamp_min(1.0).view(norm_shape)
     return out
-
-
-class SteerableSphereScalarBlock(nn.Module):
-    """Scalar -> vector -> vector -> scalar block on a sphere graph."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        vector_channels: int,
-        radius_km: float,
-        num_radial: int,
-        *,
-        vector_depth: int = 1,
-        normalize_by_neighbors: bool = True,
-        residual: bool = True,
-        include_self: bool = False,
-        include_vector_self: bool = False,
-        self_identity_init: bool = True,
-    ) -> None:
-        super().__init__()
-        if vector_depth < 0:
-            raise ValueError("vector_depth must be non-negative")
-        self.in_channels = int(in_channels)
-        self.out_channels = int(out_channels)
-        self.residual = bool(residual and in_channels == out_channels)
-        self.scalar_self_mixing = (
-            _make_scalar_self_mixing(
-                in_channels,
-                out_channels,
-                identity_init=self_identity_init,
-            )
-            if include_self
-            else None
-        )
-
-        self.scalar_to_vector = ScalarToVectorSphereConv(
-            in_channels,
-            vector_channels,
-            radius_km,
-            num_radial,
-            normalize_by_neighbors=normalize_by_neighbors,
-        )
-        self.vector_layers = nn.ModuleList(
-            [
-                VectorToVectorSphereConv(
-                    vector_channels,
-                    vector_channels,
-                    radius_km,
-                    num_radial,
-                    normalize_by_neighbors=normalize_by_neighbors,
-                    include_self=include_vector_self,
-                    self_identity_init=self_identity_init,
-                )
-                for _ in range(vector_depth)
-            ]
-        )
-        self.vector_activations = nn.ModuleList(
-            [VectorNormReLU(vector_channels) for _ in range(vector_depth + 1)]
-        )
-        self.vector_to_scalar = VectorToScalarSphereConv(
-            vector_channels,
-            out_channels,
-            radius_km,
-            num_radial,
-            normalize_by_neighbors=normalize_by_neighbors,
-            bias=True,
-        )
-
-    def forward(self, x: Tensor, graph: SphereGraphGeometry) -> Tensor:
-        if x.ndim != 3:
-            raise ValueError("x must have shape [B, N, C]")
-        y = self.scalar_to_vector(x, graph)
-        y = self.vector_activations[0](y)
-        for layer_i, layer in enumerate(self.vector_layers):
-            y = self.vector_activations[layer_i + 1](layer(y, graph))
-        y_scalar = self.vector_to_scalar(y, graph)
-        if self.scalar_self_mixing is not None:
-            y_scalar = y_scalar + self.scalar_self_mixing(x)
-        elif self.residual:
-            y_scalar = y_scalar + x
-        return y_scalar
-
-
-class VectorSphereBatchNorm(nn.Module):
-    """Gauge-equivariant variance normalization for tangent-vector channels."""
-
-    def __init__(
-        self,
-        channels: int,
-        *,
-        eps: float = 1e-5,
-        momentum: float = 0.1,
-        affine: bool = True,
-    ) -> None:
-        super().__init__()
-        self.channels = int(channels)
-        self.eps = float(eps)
-        self.momentum = float(momentum)
-        self.affine = bool(affine)
-        self.register_buffer("running_var", torch.ones(self.channels))
-        if affine:
-            self.weight = nn.Parameter(torch.ones(self.channels))
-        else:
-            self.register_parameter("weight", None)
-
-    def forward(self, x: Tensor) -> Tensor:
-        if x.ndim != 4 or x.shape[-1] != 2:
-            raise ValueError("x must have shape [B, N, C, 2]")
-        channels = int(x.shape[2])
-        if channels != self.channels:
-            raise ValueError(f"expected {self.channels} channels, got {channels}")
-        if self.training:
-            var = x.square().mean(dim=(0, 1, 3))
-            self.running_var.mul_(1.0 - self.momentum).add_(self.momentum * var.detach())
-        else:
-            var = self.running_var.to(device=x.device, dtype=x.dtype)
-        scale = torch.rsqrt(var.to(device=x.device, dtype=x.dtype).clamp_min(self.eps))
-        if self.weight is not None:
-            scale = scale * self.weight.to(device=x.device, dtype=x.dtype)
-        return x * scale.view(1, 1, self.channels, 1)
-
-
-class VectorSphereGraphPool(nn.Module):
-    """Equivariant graph mean pooling used at stride-2 positions."""
-
-    def __init__(self, edge_chunk_size: int = 4096) -> None:
-        super().__init__()
-        self.edge_chunk_size = int(edge_chunk_size)
-
-    def forward(self, x: Tensor, graph: SphereGraphGeometry) -> Tensor:
-        if x.ndim != 4 or x.shape[-1] != 2:
-            raise ValueError("x must have shape [B, N, C, 2]")
-        center_idx, neighbor_idx, _r, _q_matrix, transport, neighbor_count = _graph_tensors(graph, x)
-
-        def make_contributions(edge_slice: slice) -> Tensor:
-            x_q = x[:, neighbor_idx[edge_slice], :, :]
-            return torch.einsum("edc,beic->beid", transport[edge_slice], x_q)
-
-        return _scatter_edge_chunks(
-            x,
-            center_idx,
-            graph.n_points,
-            neighbor_count,
-            trailing_shape=(int(x.shape[2]), 2),
-            normalize_by_neighbors=True,
-            edge_weight=None,
-            edge_chunk_size=self.edge_chunk_size,
-            make_contributions=make_contributions,
-        )
 
 
 class IrrepSphereGraphPool(nn.Module):
@@ -351,12 +183,13 @@ class IrrepSphereConvBlock(nn.Module):
         regular_samples: int | None = None,
         normalize_by_neighbors: bool = True,
         edge_chunk_size: int = 2048,
-        include_self: bool = False,
-        self_identity_init: bool = True,
+        include_self: bool = True,
+        self_identity_init: bool = False,
         quadrature: bool = False,
         quadrature_radial: int | None = None,
         quadrature_angular: int = 16,
         quadrature_sigma_km: float | None = None,
+        irrep_conv_backend: Literal["auto", "torch", "triton"] = "auto",
     ) -> None:
         super().__init__()
         if stride not in (1, 2):
@@ -376,6 +209,7 @@ class IrrepSphereConvBlock(nn.Module):
             quadrature_radial=quadrature_radial,
             quadrature_angular=quadrature_angular,
             quadrature_sigma_km=quadrature_sigma_km,
+            backend=irrep_conv_backend,
         )
         self.norm = IrrepBatchNorm(out_type)
         self.activation = RegularNonlinearity(out_type, regular_samples=regular_samples)
@@ -383,6 +217,12 @@ class IrrepSphereConvBlock(nn.Module):
 
     def prepare_graph(self, graph: SphereGraphGeometry) -> None:
         self.conv.prepare_graph(graph, device=graph.device, dtype=graph.dtype)
+
+    def bind_prepared_geometry(self, geometry: _IrrepConvGeometry) -> None:
+        self.conv._bind_prepared_geometry(geometry)
+
+    def clear_prepared_graph(self) -> None:
+        self.conv.clear_prepared_graph()
 
     def forward(
         self,
@@ -398,204 +238,20 @@ class IrrepSphereConvBlock(nn.Module):
                 y = self.fallback_pool(y, graph)
         return y
 
-
-class VectorSphereConvBlock(nn.Module):
-    """S2V/V2V convolution followed by vector BN, norm-ReLU, and optional pooling."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        radius_km: float,
-        num_radial: int,
-        *,
-        scalar_input: bool,
-        stride: int,
-        normalize_by_neighbors: bool = True,
-        edge_chunk_size: int = 2048,
-        include_self: bool = False,
-        self_identity_init: bool = True,
-    ) -> None:
-        super().__init__()
-        if stride not in (1, 2):
-            raise ValueError("stride must be 1 or 2")
-        self.stride = int(stride)
-        if scalar_input:
-            self.conv = ScalarToVectorSphereConv(
-                in_channels,
-                out_channels,
-                radius_km,
-                num_radial,
-                normalize_by_neighbors=normalize_by_neighbors,
-            )
-        else:
-            self.conv = VectorToVectorSphereConv(
-                in_channels,
-                out_channels,
-                radius_km,
-                num_radial,
-                normalize_by_neighbors=normalize_by_neighbors,
-                include_self=include_self,
-                self_identity_init=self_identity_init,
-            )
-        self.norm = VectorSphereBatchNorm(out_channels)
-        self.activation = VectorNormReLU(out_channels)
-        self.fallback_pool = VectorSphereGraphPool(edge_chunk_size=edge_chunk_size) if stride == 2 else None
-
-    def forward(
+    def forward_prepared(
         self,
         x: Tensor,
+        *,
         graph: SphereGraphGeometry,
-        pooler: SpherePooler | None = None,
+        pooler: SpherePooler | SphereWeightedPooler | None = None,
     ) -> Tensor:
-        y = self.conv(x, graph)
-        y = self.norm(y)
-        y = self.activation(y)
-        if self.stride == 2:
+        y = self.activation(self.norm(self.conv.forward_prepared(x)))
+        if self.stride == 2 and self.fallback_pool is not None:
             if pooler is not None:
-                y = pooler.pool_vector(y)
-            elif self.fallback_pool is not None:
+                y = self.fallback_pool.pool_with(y, pooler)
+            else:
                 y = self.fallback_pool(y, graph)
         return y
-
-
-class SteerableSphereMNISTClassifier(nn.Module):
-    """S2V + 6 V2V continuous-gauge classifier for SphericalMNIST."""
-
-    def __init__(
-        self,
-        *,
-        in_channels: int = 1,
-        num_classes: int = 10,
-        channels: Sequence[int] | None = None,
-        strides: Sequence[int] | None = None,
-        fc_channels: Sequence[int] | None = None,
-        radius_km: float = 1300.0,
-        num_radial: int = 4,
-        dropout: float = 0.0,
-        normalize_by_neighbors: bool = True,
-        edge_chunk_size: int = 2048,
-        scalar_channels: int | None = None,
-        vector_channels: int | None = None,
-        num_blocks: int | None = None,
-        vector_depth: int | None = None,
-        mlp_hidden: int | None = None,
-        include_self: bool = False,
-        self_identity_init: bool = True,
-    ) -> None:
-        super().__init__()
-        if vector_depth is not None:
-            # Accepted for compatibility with the earlier scalar/vector block API.
-            pass
-        if channels is None:
-            if scalar_channels is not None or vector_channels is not None or num_blocks is not None:
-                block_count = int(num_blocks) if num_blocks is not None else len(_DEFAULT_VECTOR_CHANNELS)
-                if block_count < 1:
-                    raise ValueError("num_blocks must be positive")
-                width = (
-                    int(vector_channels)
-                    if vector_channels is not None
-                    else int(scalar_channels)
-                    if scalar_channels is not None
-                    else _DEFAULT_VECTOR_CHANNELS[0]
-                )
-                channels = tuple(width for _ in range(block_count))
-            else:
-                channels = _DEFAULT_VECTOR_CHANNELS
-        channels = _as_int_tuple("channels", channels)
-        if strides is None:
-            if channels == _DEFAULT_VECTOR_CHANNELS:
-                strides = _DEFAULT_VECTOR_STRIDES
-            else:
-                strides = tuple(1 for _ in channels)
-        strides = _as_int_tuple("strides", strides)
-        if len(channels) != len(strides):
-            raise ValueError("channels and strides must have the same length")
-        if any(stride not in (1, 2) for stride in strides):
-            raise ValueError("strides values must be 1 or 2")
-        if fc_channels is None:
-            if mlp_hidden is not None:
-                fc_channels = (int(mlp_hidden), int(mlp_hidden))
-            else:
-                fc_channels = _DEFAULT_FC_CHANNELS
-        fc_channels = _as_int_tuple("fc_channels", fc_channels)
-
-        blocks = []
-        current_channels = int(in_channels)
-        for layer_i, (out_channels, stride) in enumerate(zip(channels, strides)):
-            block = VectorSphereConvBlock(
-                current_channels,
-                out_channels,
-                radius_km,
-                num_radial,
-                scalar_input=layer_i == 0,
-                stride=stride,
-                normalize_by_neighbors=normalize_by_neighbors,
-                edge_chunk_size=edge_chunk_size,
-                include_self=include_self,
-                self_identity_init=self_identity_init,
-            )
-            blocks.append(block)
-            current_channels = int(out_channels)
-        self.channels = channels
-        self.strides = strides
-        self.fc_channels = fc_channels
-        self.blocks = nn.ModuleList(blocks)
-        head_layers: list[nn.Module] = []
-        hidden = (current_channels, *fc_channels, int(num_classes))
-        for layer_i, (input_dim, output_dim) in enumerate(zip(hidden, hidden[1:])):
-            head_layers.append(nn.Linear(input_dim, output_dim))
-            if layer_i < len(hidden) - 2:
-                head_layers.append(nn.ReLU())
-                if dropout > 0.0:
-                    head_layers.append(nn.Dropout(dropout))
-        self.head = nn.Sequential(*head_layers)
-
-    def forward(
-        self,
-        x: Tensor | dict[str, Tensor],
-        graph: SphereGraphGeometry | SphereGraphHierarchy,
-    ) -> Tensor:
-        if isinstance(x, dict):
-            x = x["features"]
-        if x.ndim == 2:
-            x = x.unsqueeze(-1)
-        if x.ndim != 3:
-            raise ValueError("x must have shape [B, N, C] or [B, N]")
-
-        if isinstance(graph, SphereGraphHierarchy):
-            hierarchy = graph.to(device=x.device, dtype=x.dtype)
-            required_levels = 1 + sum(1 for block in self.blocks if block.stride == 2)
-            if hierarchy.n_levels < required_levels:
-                raise ValueError(
-                    f"hierarchy has {hierarchy.n_levels} levels, but model strides require {required_levels}"
-                )
-            graphs = hierarchy.graphs
-            poolers = hierarchy.poolers
-        else:
-            hierarchy = None
-            graphs = (graph.to(device=x.device, dtype=x.dtype),)
-            poolers = ()
-
-        y = x
-        level_i = 0
-        for block in self.blocks:
-            current_graph = graphs[level_i]
-            pooler = poolers[level_i] if hierarchy is not None and block.stride == 2 else None
-            y = block(y, current_graph, pooler)
-            if hierarchy is not None and block.stride == 2:
-                level_i += 1
-        pooled = torch.linalg.vector_norm(y, dim=-1).mean(dim=1)
-        return self.head(pooled)
-
-    @staticmethod
-    def loss(logits: Tensor, labels: Tensor) -> Tensor:
-        return torch.nn.functional.cross_entropy(logits, labels)
-
-    @staticmethod
-    def accuracy(logits: Tensor, labels: Tensor) -> float:
-        predicted = torch.argmax(logits.detach(), dim=1)
-        return float((predicted == labels).to(dtype=torch.float32).mean().item())
 
 
 class IrrepSphereMNISTClassifier(nn.Module):
@@ -616,34 +272,27 @@ class IrrepSphereMNISTClassifier(nn.Module):
         edge_chunk_size: int = 2048,
         max_order: int = 2,
         regular_samples: int | None = None,
-        num_blocks: int | None = None,
-        mlp_hidden: int | None = None,
-        include_self: bool = False,
-        self_identity_init: bool = True,
+        include_self: bool = True,
+        self_identity_init: bool = False,
         quadrature: bool = False,
         quadrature_radial: int | None = None,
         quadrature_angular: int = 16,
         quadrature_sigma_km: float | None = None,
+        irrep_conv_backend: Literal["auto", "torch", "triton"] = "auto",
     ) -> None:
         super().__init__()
         if channels is None:
-            if num_blocks is not None:
-                block_count = int(num_blocks)
-                if block_count < 1:
-                    raise ValueError("num_blocks must be positive")
-                channels = tuple(_DEFAULT_VECTOR_CHANNELS[0] for _ in range(block_count))
-            else:
-                channels = _DEFAULT_VECTOR_CHANNELS
+            channels = _DEFAULT_IRREP_CHANNELS
         channels = _as_int_tuple("channels", channels)
         if strides is None:
-            strides = _DEFAULT_VECTOR_STRIDES if channels == _DEFAULT_VECTOR_CHANNELS else tuple(1 for _ in channels)
+            strides = _DEFAULT_IRREP_STRIDES if channels == _DEFAULT_IRREP_CHANNELS else tuple(1 for _ in channels)
         strides = _as_int_tuple("strides", strides)
         if len(channels) != len(strides):
             raise ValueError("channels and strides must have the same length")
         if any(stride not in (1, 2) for stride in strides):
             raise ValueError("strides values must be 1 or 2")
         if fc_channels is None:
-            fc_channels = (int(mlp_hidden), int(mlp_hidden)) if mlp_hidden is not None else _DEFAULT_FC_CHANNELS
+            fc_channels = _DEFAULT_FC_CHANNELS
         fc_channels = _as_int_tuple("fc_channels", fc_channels)
 
         blocks = []
@@ -666,6 +315,7 @@ class IrrepSphereMNISTClassifier(nn.Module):
                     quadrature_radial=quadrature_radial,
                     quadrature_angular=quadrature_angular,
                     quadrature_sigma_km=quadrature_sigma_km,
+                    irrep_conv_backend=irrep_conv_backend,
                 )
             )
             current_type = out_type
@@ -678,6 +328,7 @@ class IrrepSphereMNISTClassifier(nn.Module):
         self.quadrature_radial = quadrature_radial
         self.quadrature_angular = int(quadrature_angular)
         self.quadrature_sigma_km = quadrature_sigma_km
+        self.irrep_conv_backend = str(irrep_conv_backend)
         self.blocks = nn.ModuleList(blocks)
         self.output_type = current_type
 
@@ -690,6 +341,10 @@ class IrrepSphereMNISTClassifier(nn.Module):
                 if dropout > 0.0:
                     head_layers.append(nn.Dropout(dropout))
         self.head = nn.Sequential(*head_layers)
+        self._prepared_graph: SphereGraphGeometry | SphereGraphHierarchy | None = None
+        self._prepared_graphs: tuple[SphereGraphGeometry, ...] = ()
+        self._prepared_poolers: tuple[SpherePooler | SphereWeightedPooler, ...] = ()
+        self._geometry_banks: tuple[_IrrepConvGeometry, ...] = ()
 
     def _invariant_readout(self, x: Tensor) -> Tensor:
         pooled = []
@@ -705,23 +360,94 @@ class IrrepSphereMNISTClassifier(nn.Module):
         self,
         graph: SphereGraphGeometry | SphereGraphHierarchy,
     ) -> None:
-        """Warm all layer-specific geometry caches before processing batches."""
+        """Replace the classifier's static graph binding and shared geometry banks."""
 
+        self.clear_prepared_graph()
+        required_levels = 1 + sum(1 for block in self.blocks if block.stride == 2)
         if isinstance(graph, SphereGraphHierarchy):
-            graphs = graph.graphs
+            if graph.n_levels < required_levels:
+                raise ValueError(
+                    f"hierarchy has {graph.n_levels} levels, but model strides require "
+                    f"{required_levels}"
+                )
+            graphs = graph.graphs[:required_levels]
+            poolers = graph.poolers[: required_levels - 1]
+            blocks_by_level: list[list[IrrepSphereConvBlock]] = [
+                [] for _ in range(required_levels)
+            ]
+            level_i = 0
+            for block in self.blocks:
+                blocks_by_level[level_i].append(block)
+                if block.stride == 2:
+                    level_i += 1
         else:
             graphs = (graph,)
-        level_i = 0
+            poolers = ()
+            blocks_by_level = [list(self.blocks)]
+
+        banks = []
+        for level_graph, level_blocks in zip(graphs, blocks_by_level):
+            if not level_blocks:
+                continue
+            convolutions = tuple(block.conv for block in level_blocks)
+            representative = convolutions[0]
+            signature = representative._geometry_signature()
+            if any(conv._geometry_signature() != signature for conv in convolutions[1:]):
+                raise RuntimeError("all classifier convolutions on a level must share geometry settings")
+            in_orders = tuple(sorted({order for conv in convolutions for order in conv._in_orders}))
+            out_orders = tuple(sorted({order for conv in convolutions for order in conv._out_orders}))
+            bank = representative._build_geometry(
+                level_graph,
+                level_graph.device,
+                level_graph.dtype,
+                in_orders=in_orders,
+                out_orders=out_orders,
+            )
+            for block in level_blocks:
+                block.bind_prepared_geometry(bank)
+            banks.append(bank)
+
+        self._prepared_graph = graph
+        self._prepared_graphs = tuple(graphs)
+        self._prepared_poolers = tuple(poolers)
+        self._geometry_banks = tuple(banks)
+
+    def prepare_hierarchy(self, hierarchy: SphereGraphHierarchy) -> None:
+        """Wrapper-compatible alias for binding a static hierarchy."""
+
+        self.prepare_graph(hierarchy)
+
+    def clear_prepared_graph(self) -> None:
         for block in self.blocks:
-            block.prepare_graph(graphs[level_i])
-            if isinstance(graph, SphereGraphHierarchy) and block.stride == 2:
-                level_i += 1
+            block.clear_prepared_graph()
+        self._prepared_graph = None
+        self._prepared_graphs = ()
+        self._prepared_poolers = ()
+        self._geometry_banks = ()
+
+    def clear_prepared_hierarchy(self) -> None:
+        self.clear_prepared_graph()
+
+    def _apply(self, fn, recurse: bool = True):
+        self.clear_prepared_graph()
+        return super()._apply(fn, recurse=recurse)
 
     def forward(
         self,
         x: Tensor | dict[str, Tensor],
         graph: SphereGraphGeometry | SphereGraphHierarchy,
     ) -> Tensor:
+        if self._prepared_graph is None:
+            raise RuntimeError("graph geometry is not prepared; call prepare_graph() before forward()")
+        if graph is not self._prepared_graph:
+            raise RuntimeError(
+                "the classifier is bound to a different graph; call prepare_graph() to replace it"
+            )
+        return self.forward_prepared(x)
+
+    def forward_prepared(self, x: Tensor | dict[str, Tensor]) -> Tensor:
+        """Run classification using the statically bound graph geometry."""
+
         if isinstance(x, dict):
             x = x["features"]
         if x.ndim == 2:
@@ -729,35 +455,23 @@ class IrrepSphereMNISTClassifier(nn.Module):
         if x.ndim != 3:
             raise ValueError("x must have shape [B, N, C] or [B, N]")
 
-        if isinstance(graph, SphereGraphHierarchy):
-            if all(level.device == x.device and level.dtype == x.dtype for level in graph.graphs):
-                hierarchy = graph
-            else:
-                hierarchy = graph.to(device=x.device, dtype=x.dtype)
-            required_levels = 1 + sum(1 for block in self.blocks if block.stride == 2)
-            if hierarchy.n_levels < required_levels:
-                raise ValueError(
-                    f"hierarchy has {hierarchy.n_levels} levels, but model strides require {required_levels}"
-                )
-            graphs = hierarchy.graphs
-            poolers = hierarchy.poolers
-        else:
-            hierarchy = None
-            current_graph = (
-                graph
-                if graph.device == x.device and graph.dtype == x.dtype
-                else graph.to(device=x.device, dtype=x.dtype)
+        if not self._prepared_graphs:
+            raise RuntimeError("graph geometry is not prepared; call prepare_graph() before forward()")
+        graphs = self._prepared_graphs
+        poolers = self._prepared_poolers
+        hierarchy_bound = isinstance(self._prepared_graph, SphereGraphHierarchy)
+        if graphs[0].device != x.device or graphs[0].dtype != x.dtype:
+            raise RuntimeError(
+                "prepared graph device/dtype does not match x; call prepare_graph() again"
             )
-            graphs = (current_graph,)
-            poolers = ()
 
         y = x
         level_i = 0
         for block in self.blocks:
             current_graph = graphs[level_i]
-            pooler = poolers[level_i] if hierarchy is not None and block.stride == 2 else None
-            y = block(y, current_graph, pooler)
-            if hierarchy is not None and block.stride == 2:
+            pooler = poolers[level_i] if hierarchy_bound and block.stride == 2 else None
+            y = block.forward_prepared(y, graph=current_graph, pooler=pooler)
+            if hierarchy_bound and block.stride == 2:
                 level_i += 1
         return self.head(self._invariant_readout(y))
 

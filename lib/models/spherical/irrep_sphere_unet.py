@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal
 
 import torch
 from torch import Tensor, nn
@@ -8,7 +9,8 @@ from torch import Tensor, nn
 from ...data.spherical.sphere_graph import SphereGraphGeometry
 from ...data.spherical.sphere_hierarchy import SphereGraphHierarchy, SpherePooler, SphereWeightedPooler
 from .spherical_mnist_model import IrrepSphereGraphPool
-from .steerable_layers import (
+from .profile_ranges import record_region
+from .irrep_layers import (
     IrrepBatchNorm,
     IrrepSphereConv,
     RegularNonlinearity,
@@ -139,6 +141,7 @@ class _IrrepSphereDoubleConv(nn.Module):
         quadrature_radial: int | None,
         quadrature_angular: int,
         quadrature_sigma_km: float | None,
+        irrep_conv_backend: Literal["auto", "torch", "triton"],
     ) -> None:
         super().__init__()
         conv_kwargs = {
@@ -149,6 +152,7 @@ class _IrrepSphereDoubleConv(nn.Module):
             "quadrature_radial": quadrature_radial,
             "quadrature_angular": quadrature_angular,
             "quadrature_sigma_km": quadrature_sigma_km,
+            "backend": irrep_conv_backend,
         }
         self.in_type = in_type
         self.out_type = out_type
@@ -188,8 +192,20 @@ class _IrrepSphereDoubleConv(nn.Module):
         return self.activation2(self.norm2(self.conv2(x, graph)))
 
     def forward_prepared(self, x: Tensor) -> Tensor:
-        x = self.activation1(self.norm1(self.conv1.forward_prepared(x)))
-        return self.activation2(self.norm2(self.conv2.forward_prepared(x)))
+        profile_name = getattr(self, "_irrep_profile_name", "double_conv")
+        with record_region(f"module/{profile_name}"):
+            with record_region(f"module/{profile_name}.conv1"):
+                x = self.conv1.forward_prepared(x)
+            with record_region(f"module/{profile_name}.norm1"):
+                x = self.norm1(x)
+            with record_region(f"module/{profile_name}.activation1"):
+                x = self.activation1(x)
+            with record_region(f"module/{profile_name}.conv2"):
+                x = self.conv2.forward_prepared(x)
+            with record_region(f"module/{profile_name}.norm2"):
+                x = self.norm2(x)
+            with record_region(f"module/{profile_name}.activation2"):
+                return self.activation2(x)
 
 
 class IrrepSphereUNet(nn.Module):
@@ -206,12 +222,13 @@ class IrrepSphereUNet(nn.Module):
         num_radial: int = 4,
         regular_samples: int | None = None,
         normalize_by_neighbors: bool = True,
-        include_self: bool = False,
-        self_identity_init: bool = True,
+        include_self: bool = True,
+        self_identity_init: bool = False,
         quadrature: bool = False,
         quadrature_radial: int | None = None,
         quadrature_angular: int = 16,
         quadrature_sigma_km: float | None = None,
+        irrep_conv_backend: Literal["auto", "torch", "triton"] = "auto",
     ) -> None:
         super().__init__()
         widths = tuple(int(value) for value in multiplicities)
@@ -234,6 +251,7 @@ class IrrepSphereUNet(nn.Module):
         self.output_type = output_type
         self.multiplicities = widths
         self.max_order = hidden_max_order
+        self.irrep_conv_backend = str(irrep_conv_backend)
         self.level_types = tuple(
             SO2IrrepFieldType.balanced(hidden_max_order, width) for width in widths
         )
@@ -249,6 +267,7 @@ class IrrepSphereUNet(nn.Module):
             "quadrature_radial": quadrature_radial,
             "quadrature_angular": quadrature_angular,
             "quadrature_sigma_km": quadrature_sigma_km,
+            "irrep_conv_backend": irrep_conv_backend,
         }
         encoder_in_types = (in_type, *self.level_types[:-1])
         self.encoder_blocks = nn.ModuleList(
@@ -276,8 +295,9 @@ class IrrepSphereUNet(nn.Module):
         final_kwargs = {
             key: value
             for key, value in block_kwargs.items()
-            if key != "regular_samples"
+            if key not in ("regular_samples", "irrep_conv_backend")
         }
+        final_kwargs["backend"] = irrep_conv_backend
         self.output_conv = IrrepSphereConv(
             self.level_types[0],
             output_type,
@@ -308,22 +328,39 @@ class IrrepSphereUNet(nn.Module):
 
         banks = []
         for graph, convolutions in zip(hierarchy.graphs[:4], self._convolutions_by_level()):
-            representative = convolutions[0]
-            signature = representative._geometry_signature()
-            if any(conv._geometry_signature() != signature for conv in convolutions[1:]):
-                raise RuntimeError("all convolutions on a hierarchy level must share geometry settings")
-            in_orders = tuple(sorted({order for conv in convolutions for order in conv._in_orders}))
-            out_orders = tuple(sorted({order for conv in convolutions for order in conv._out_orders}))
-            bank = representative._build_geometry(
-                graph,
-                graph.device,
-                graph.dtype,
-                in_orders=in_orders,
-                out_orders=out_orders,
-            )
+            compatible_groups: dict[tuple, list[IrrepSphereConv]] = {}
             for conv in convolutions:
-                conv._bind_prepared_geometry(bank)
-            banks.append(bank)
+                compatible_groups.setdefault(conv._geometry_signature(), []).append(conv)
+            for compatible_convolutions in compatible_groups.values():
+                representative = compatible_convolutions[0]
+                in_orders = tuple(
+                    sorted(
+                        {
+                            order
+                            for conv in compatible_convolutions
+                            for order in conv._in_orders
+                        }
+                    )
+                )
+                out_orders = tuple(
+                    sorted(
+                        {
+                            order
+                            for conv in compatible_convolutions
+                            for order in conv._out_orders
+                        }
+                    )
+                )
+                bank = representative._build_geometry(
+                    graph,
+                    graph.device,
+                    graph.dtype,
+                    in_orders=in_orders,
+                    out_orders=out_orders,
+                )
+                for conv in compatible_convolutions:
+                    conv._bind_prepared_geometry(bank)
+                banks.append(bank)
 
         self._geometry_banks = tuple(banks)
         self._prepared_hierarchy = hierarchy
@@ -375,25 +412,31 @@ class IrrepSphereUNet(nn.Module):
         skips = []
         y = x
         for level, block in enumerate(self.encoder_blocks):
-            y = block.forward_prepared(y)
+            with record_region(f"stage/encoder.{level}"):
+                y = block.forward_prepared(y)
             if level < 3:
                 skips.append(y)
-                y = self.pool_layers[level].pool_with(y, poolers[level])
+                with record_region(f"module/pool.{level}"):
+                    y = self.pool_layers[level].pool_with(y, poolers[level])
 
         for decoder_index, (unpool, block) in enumerate(
             zip(self.unpool_layers, self.decoder_blocks)
         ):
             pooler = poolers[2 - decoder_index]
-            y = unpool(y, pooler)
+            with record_region(f"module/unpool.{decoder_index}"):
+                y = unpool(y, pooler)
             skip = skips[2 - decoder_index]
-            y = _concatenate_irrep_fields(
-                y,
-                self.level_types[3 - decoder_index],
-                skip,
-                self.level_types[2 - decoder_index],
-            )
-            y = block.forward_prepared(y)
-        return self.output_conv.forward_prepared(y)
+            with record_region(f"op/skip_concat.{decoder_index}"):
+                y = _concatenate_irrep_fields(
+                    y,
+                    self.level_types[3 - decoder_index],
+                    skip,
+                    self.level_types[2 - decoder_index],
+                )
+            with record_region(f"stage/decoder.{decoder_index}"):
+                y = block.forward_prepared(y)
+        with record_region("module/output_conv"):
+            return self.output_conv.forward_prepared(y)
 
     @staticmethod
     def _validate_hierarchy(hierarchy: SphereGraphHierarchy) -> None:

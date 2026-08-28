@@ -15,7 +15,7 @@ from torch import Tensor, nn
 
 from ...data.spherical.sphere_geometry import TangentFrameStrategy, latlon_to_xyz
 from ...data.spherical.sphere_hierarchy import SphereGraphHierarchy, build_fps_sphere_hierarchy
-from .steerable_layers import SO2IrrepFieldType
+from .irrep_layers import IrrepSphereConv, SO2IrrepFieldType
 
 OutputLayout = Literal["auto", "grid", "flat"]
 
@@ -205,6 +205,7 @@ class SphereGridModelWrapper(nn.Module):
         frame_strategy: TangentFrameStrategy = "robust",
         input_schema: FieldSchema | None = None,
         output_schema: FieldSchema | None = None,
+        irrep_conv_backend: Literal["auto", "torch", "triton"] | None = None,
         from_file: str | PathLike[str] | None = None,
         to_file: str | PathLike[str] | None = None,
     ) -> None:
@@ -221,8 +222,15 @@ class SphereGridModelWrapper(nn.Module):
             raise ValueError("output_layout must be 'auto', 'grid', or 'flat'")
         self._validate_model_schema(model, input_schema, "in_type", "input_schema")
         self._validate_model_schema(model, output_schema, "output_type", "output_schema")
+        if irrep_conv_backend is not None:
+            if irrep_conv_backend not in ("auto", "torch", "triton"):
+                raise ValueError("irrep_conv_backend must be 'auto', 'torch', 'triton', or None")
+            for module in model.modules():
+                if isinstance(module, IrrepSphereConv):
+                    module.backend = irrep_conv_backend
 
         self.model = model
+        self.irrep_conv_backend = irrep_conv_backend
         self.input_schema = input_schema
         self.output_schema = output_schema
         self.input_adapter = (
