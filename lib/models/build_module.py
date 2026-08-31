@@ -177,7 +177,7 @@ def build_correction_model(cfg, grid=None):
         model = _wrap_with_location_encoder(model, location_cfg, grid).to(cfg.device)
         model = _wrap_with_input_channel_selector(model, drop_first_channels).to(cfg.device)
     elif model_type == 'irrepsphereunet':
-        from lib.models.spherical.steerable_layers import SO2IrrepFieldType
+        from lib.models.spherical.irrep_layers import SO2IrrepFieldType
         from lib.models.spherical.irrep_sphere_unet import IrrepSphereUNet
         from lib.models.spherical.sphere_grid_wrapper import SphereGridModelWrapper
         unet_cfg = cfg.model_args.IrrepSphereUNet

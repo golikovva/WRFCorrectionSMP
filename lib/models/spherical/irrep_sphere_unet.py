@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from ...data.spherical.sphere_graph import SphereGraphGeometry
 from ...data.spherical.sphere_hierarchy import SphereGraphHierarchy, SpherePooler, SphereWeightedPooler
 from .spherical_mnist_model import IrrepSphereGraphPool
-from .profile_ranges import record_region
+from .profile_ranges import record_region_call
 from .irrep_layers import (
     IrrepBatchNorm,
     IrrepSphereConv,
@@ -193,19 +193,25 @@ class _IrrepSphereDoubleConv(nn.Module):
 
     def forward_prepared(self, x: Tensor) -> Tensor:
         profile_name = getattr(self, "_irrep_profile_name", "double_conv")
-        with record_region(f"module/{profile_name}"):
-            with record_region(f"module/{profile_name}.conv1"):
-                x = self.conv1.forward_prepared(x)
-            with record_region(f"module/{profile_name}.norm1"):
-                x = self.norm1(x)
-            with record_region(f"module/{profile_name}.activation1"):
-                x = self.activation1(x)
-            with record_region(f"module/{profile_name}.conv2"):
-                x = self.conv2.forward_prepared(x)
-            with record_region(f"module/{profile_name}.norm2"):
-                x = self.norm2(x)
-            with record_region(f"module/{profile_name}.activation2"):
-                return self.activation2(x)
+        return record_region_call(
+            f"module/{profile_name}", self._forward_prepared_ops, x, profile_name
+        )
+
+    def _forward_prepared_ops(self, x: Tensor, profile_name: str) -> Tensor:
+        x = record_region_call(
+            f"module/{profile_name}.conv1", self.conv1.forward_prepared, x
+        )
+        x = record_region_call(f"module/{profile_name}.norm1", self.norm1, x)
+        x = record_region_call(
+            f"module/{profile_name}.activation1", self.activation1, x
+        )
+        x = record_region_call(
+            f"module/{profile_name}.conv2", self.conv2.forward_prepared, x
+        )
+        x = record_region_call(f"module/{profile_name}.norm2", self.norm2, x)
+        return record_region_call(
+            f"module/{profile_name}.activation2", self.activation2, x
+        )
 
 
 class IrrepSphereUNet(nn.Module):
@@ -412,31 +418,38 @@ class IrrepSphereUNet(nn.Module):
         skips = []
         y = x
         for level, block in enumerate(self.encoder_blocks):
-            with record_region(f"stage/encoder.{level}"):
-                y = block.forward_prepared(y)
+            y = record_region_call(
+                f"stage/encoder.{level}", block.forward_prepared, y
+            )
             if level < 3:
                 skips.append(y)
-                with record_region(f"module/pool.{level}"):
-                    y = self.pool_layers[level].pool_with(y, poolers[level])
+                y = record_region_call(
+                    f"module/pool.{level}",
+                    self.pool_layers[level].pool_with,
+                    y,
+                    poolers[level],
+                )
 
         for decoder_index, (unpool, block) in enumerate(
             zip(self.unpool_layers, self.decoder_blocks)
         ):
             pooler = poolers[2 - decoder_index]
-            with record_region(f"module/unpool.{decoder_index}"):
-                y = unpool(y, pooler)
+            y = record_region_call(f"module/unpool.{decoder_index}", unpool, y, pooler)
             skip = skips[2 - decoder_index]
-            with record_region(f"op/skip_concat.{decoder_index}"):
-                y = _concatenate_irrep_fields(
-                    y,
-                    self.level_types[3 - decoder_index],
-                    skip,
-                    self.level_types[2 - decoder_index],
-                )
-            with record_region(f"stage/decoder.{decoder_index}"):
-                y = block.forward_prepared(y)
-        with record_region("module/output_conv"):
-            return self.output_conv.forward_prepared(y)
+            y = record_region_call(
+                f"op/skip_concat.{decoder_index}",
+                _concatenate_irrep_fields,
+                y,
+                self.level_types[3 - decoder_index],
+                skip,
+                self.level_types[2 - decoder_index],
+            )
+            y = record_region_call(
+                f"stage/decoder.{decoder_index}", block.forward_prepared, y
+            )
+        return record_region_call(
+            "module/output_conv", self.output_conv.forward_prepared, y
+        )
 
     @staticmethod
     def _validate_hierarchy(hierarchy: SphereGraphHierarchy) -> None:

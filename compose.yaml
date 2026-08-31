@@ -1,0 +1,25 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: wrf_correction_dev
+
+    working_dir: /home/experiments/train_test
+
+    volumes:
+      - .:/home
+
+    gpus: all
+
+    cap_add:
+      - PERFMON
+      
+    ports:
+      - "9997:9997"
+
+    stdin_open: true
+    tty: true
+
+    command: sleep infinity

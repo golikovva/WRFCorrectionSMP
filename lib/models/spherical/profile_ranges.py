@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from contextvars import ContextVar
 from collections import defaultdict
-from typing import ContextManager, Any
+from typing import ContextManager, Any, Callable, TypeVar
 
 import torch
 from torch.profiler import record_function
@@ -15,6 +15,7 @@ _RANGES_ENABLED: ContextVar[bool] = ContextVar("irrep_profile_ranges_enabled", d
 _CUDA_EVENTS: ContextVar[list[tuple[str, Any, Any]] | None] = ContextVar(
     "irrep_profile_cuda_events", default=None,
 )
+_T = TypeVar("_T")
 
 
 class profile_ranges:
@@ -85,12 +86,26 @@ class _RecordedRegion:
 
 
 def record_region(name: str) -> ContextManager[object]:
-    """Return a named profiler range, or a no-op when profiling is disabled."""
+    """Return a named profiler range, or a no-op when profiling/compiling."""
 
+    # ContextVar.get() and profiler range objects are not traceable by
+    # TorchDynamo. Keep them out of fullgraph=True compiled forwards while
+    # preserving the ranges for eager profiling.
+    if torch.compiler.is_compiling():
+        return nullcontext()
     if not _RANGES_ENABLED.get():
         return nullcontext()
     full_name = f"irrep::{name}"
     return _RecordedRegion(full_name, _CUDA_EVENTS.get())
 
 
-__all__ = ["profile_ranges", "record_region"]
+def record_region_call(name: str, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+    """Call ``fn`` inside a range in eager mode and directly while compiling."""
+
+    if torch.compiler.is_compiling():
+        return fn(*args, **kwargs)
+    with record_region(name):
+        return fn(*args, **kwargs)
+
+
+__all__ = ["profile_ranges", "record_region", "record_region_call"]

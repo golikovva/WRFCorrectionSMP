@@ -387,25 +387,47 @@ class ConvolutionComparison:
             paths["packed"] = lambda x: module._forward_spatial_packed(x, geometry)
         reason = module._triton_unsupported_reason(x_base, geometry)
         if reason is None:
+            def irregular_triton(x: Tensor, *, fast_path: bool) -> Tensor:
+                previous = module._irregular_r1_fast_path
+                module._irregular_r1_fast_path = fast_path
+                try:
+                    return module._forward_spatial_triton(x, geometry)
+                finally:
+                    module._irregular_r1_fast_path = previous
+
+            if not module._regular_weights and module.num_radial == 1:
+                paths["triton_legacy"] = lambda x: irregular_triton(
+                    x, fast_path=False,
+                )
             paths["triton"] = lambda x: module._forward_spatial_triton(x, geometry)
         reference_name = "packed" if "packed" in paths else "blockwise"
         reference = paths[reference_name](x_base).detach()
         grad_out = torch.randn_like(reference)
         reference_grad_x: Tensor | None = None
-        reference_grad_weight: Tensor | None = None
-        weight_parameter = getattr(module, "packed_weight", None)
-        if include_backward and weight_parameter is not None:
+        reference_grad_weights: tuple[Tensor, ...] | None = None
+        packed_weight = getattr(module, "packed_weight", None)
+        weight_parameters = (
+            (packed_weight,)
+            if packed_weight is not None
+            else tuple(module.weights.values())
+        )
+        if include_backward:
             reference_x = x_base.detach().requires_grad_(True)
             reference_y = paths[reference_name](reference_x)
-            reference_grad_x, reference_grad_weight = torch.autograd.grad(
-                reference_y, (reference_x, weight_parameter), grad_out,
+            reference_grads = torch.autograd.grad(
+                reference_y, (reference_x, *weight_parameters), grad_out,
             )
-            if reference_grad_x is None or reference_grad_weight is None:
+            reference_grad_x = reference_grads[0]
+            reference_grad_weights = tuple(reference_grads[1:])
+            if reference_grad_x is None or any(
+                grad is None for grad in reference_grad_weights
+            ):
                 raise RuntimeError("reference convolution returned an unused gradient")
             reference_grad_x = reference_grad_x.detach()
-            reference_grad_weight = reference_grad_weight.detach()
-        original_grad = getattr(module, "packed_weight", None)
-        original_grad = None if original_grad is None else original_grad.grad
+            reference_grad_weights = tuple(
+                grad.detach() for grad in reference_grad_weights
+            )
+        original_grads = tuple(parameter.grad for parameter in weight_parameters)
         rows = []
         try:
             for path_name, path in paths.items():
@@ -434,34 +456,52 @@ class ConvolutionComparison:
                         grad_weight_close = None
                         grad_x_error = None
                         grad_weight_error = None
-                        if weight_parameter is not None:
-                            check_x = x_base.detach().requires_grad_(True)
-                            check_y = path(check_x)
-                            check_grad_x, check_grad_weight = torch.autograd.grad(
-                                check_y, (check_x, weight_parameter), grad_out,
+                        check_x = x_base.detach().requires_grad_(True)
+                        check_y = path(check_x)
+                        check_grads = torch.autograd.grad(
+                            check_y, (check_x, *weight_parameters), grad_out,
+                        )
+                        check_grad_x = check_grads[0]
+                        check_grad_weights = tuple(check_grads[1:])
+                        grad_tolerance = _gradient_tolerance(
+                            case.dtype, self.config.correctness_atol
+                        )
+                        assert reference_grad_x is not None
+                        assert reference_grad_weights is not None
+                        grad_x_close = torch.allclose(
+                            check_grad_x, reference_grad_x,
+                            atol=grad_tolerance, rtol=grad_tolerance,
+                        )
+                        grad_weight_close = all(
+                            torch.allclose(
+                                actual_weight_grad,
+                                reference_weight_grad,
+                                atol=grad_tolerance,
+                                rtol=grad_tolerance,
                             )
-                            grad_tolerance = _gradient_tolerance(case.dtype, self.config.correctness_atol)
-                            assert reference_grad_x is not None and reference_grad_weight is not None
-                            grad_x_close = torch.allclose(
-                                check_grad_x, reference_grad_x,
-                                atol=grad_tolerance, rtol=grad_tolerance,
+                            for actual_weight_grad, reference_weight_grad in zip(
+                                check_grad_weights, reference_grad_weights
                             )
-                            grad_weight_close = torch.allclose(
-                                check_grad_weight, reference_grad_weight,
-                                atol=grad_tolerance, rtol=grad_tolerance,
+                        )
+                        grad_x_error = float(
+                            (check_grad_x.float() - reference_grad_x.float()).abs().max()
+                        )
+                        grad_weight_error = max(
+                            float(
+                                (
+                                    actual_weight_grad.float()
+                                    - reference_weight_grad.float()
+                                ).abs().max()
                             )
-                            grad_x_error = float(
-                                (check_grad_x.float() - reference_grad_x.float()).abs().max()
+                            for actual_weight_grad, reference_weight_grad in zip(
+                                check_grad_weights, reference_grad_weights
                             )
-                            grad_weight_error = float(
-                                (check_grad_weight.float() - reference_grad_weight.float()).abs().max()
-                            )
+                        )
 
                         def backward_step() -> None:
                             x = x_base.detach().requires_grad_(True)
-                            weight = getattr(module, "packed_weight", None)
-                            if weight is not None:
-                                weight.grad = None
+                            for parameter in weight_parameters:
+                                parameter.grad = None
                             path(x).backward(grad_out)
 
                         backward = _measure_cuda(
@@ -491,9 +531,8 @@ class ConvolutionComparison:
                         "speedup_vs_reference": None, "reason": str(error),
                     })
         finally:
-            weight = getattr(module, "packed_weight", None)
-            if weight is not None:
-                weight.grad = original_grad
+            for parameter, original_grad in zip(weight_parameters, original_grads):
+                parameter.grad = original_grad
         for mode in ("forward", "forward+backward"):
             reference_rows = [row for row in rows if row["path"] == reference_name and row["mode"] == mode]
             if not reference_rows:

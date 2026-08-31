@@ -12,13 +12,17 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .radial_basis import default_radial_sigma, radial_centers, triangular_radial_basis
-from .profile_ranges import record_region
+from .profile_ranges import record_region_call
 from .triton_irrep_conv import (
     AUTO_INFERENCE_WORK_THRESHOLDS,
     AUTO_TRAINING_WORK_THRESHOLDS,
     AUTO_WORK_THRESHOLD,
     packed_irrep_conv,
     triton_support_reason,
+)
+from .triton_irregular_irrep_conv import (
+    irregular_irrep_pair_conv,
+    irregular_pair_support_reason,
 )
 from ...data.spherical.sphere_geometry import rotation_matrices_from_cos_sin
 from ...data.spherical.sphere_graph import SphereGraphGeometry
@@ -67,6 +71,32 @@ def _scatter_to_centers(
         norm_shape = (1, n_points, *([1] * len(trailing)))
         out = out / neighbor_count.clamp_min(1.0).view(norm_shape)
     return out
+
+
+def _pack_irrep_field(
+    x: Tensor,
+    index: Tensor,
+    batch: int,
+    n_points: int,
+    multiplicity: int,
+    irrep_dim: int,
+) -> Tensor:
+    return x.index_select(-1, index).reshape(
+        batch, n_points, multiplicity, irrep_dim
+    )
+
+
+def _gather_irrep_neighbors(x: Tensor, neighbor_idx: Tensor) -> Tensor:
+    return x[:, neighbor_idx, :, :]
+
+
+def _quadrature_contribution(basis: Tensor, weight: Tensor, x_q: Tensor) -> Tensor:
+    kernel = torch.einsum("erabcd,roibc->eoiad", basis, weight)
+    return torch.einsum("eoiad,beid->beoa", kernel, x_q)
+
+
+def _unpack_irrep_field(x: Tensor, index: Tensor) -> Tensor:
+    return x.flatten(start_dim=-2).index_select(-1, index)
 
 
 class _RadialBasisConvBase(nn.Module):
@@ -541,6 +571,9 @@ class IrrepSphereConv(_RadialBasisConvBase):
             self.register_buffer("quadrature_theta", unit_rule.theta)
             self.register_buffer("quadrature_weight", unit_rule.weight)
         self._prepared_geometry: _IrrepConvGeometry | None = None
+        # Private benchmark/debug switch. It is deliberately not a parameter or
+        # buffer, so checkpoints and the public constructor stay unchanged.
+        self._irregular_r1_fast_path = True
         self._weight_keys: dict[tuple[int, int], str] = {}
         self._regular_weights = in_type.is_regular() and out_type.is_regular()
         self._use_packed_fast_path = (
@@ -923,32 +956,56 @@ class IrrepSphereConv(_RadialBasisConvBase):
                 "prepared geometry device/dtype does not match x; call prepare_graph() again"
             )
 
-        if self.backend == "triton" and (self.quadrature or not self._regular_weights):
-            raise RuntimeError(
-                "Triton backend only supports regular packed quadrature=False convolutions"
-            )
         capture = getattr(self, "_irrep_profile_capture", None)
         if capture is not None:
             capture(self, x, geometry)
         use_triton = self._should_use_triton(x, geometry)
         profile_name = getattr(self, "_irrep_profile_name", "IrrepSphereConv")
-        with record_region(f"module/{profile_name}"):
-            if use_triton:
-                out = self._forward_spatial_triton(x, geometry)
-            elif self._use_packed_fast_path:
-                out = self._forward_spatial_packed(x, geometry)
-            else:
-                out = self._forward_spatial_blockwise(x, geometry)
-            if self.self_mixing is not None:
-                with record_region("op/conv.self_mixing"):
-                    out = out + self.self_mixing(x)
+        return record_region_call(
+            f"module/{profile_name}",
+            self._forward_prepared_backend,
+            x,
+            geometry,
+            use_triton,
+        )
+
+    def _forward_prepared_backend(
+        self, x: Tensor, geometry: _IrrepConvGeometry, use_triton: bool
+    ) -> Tensor:
+        if use_triton:
+            out = self._forward_spatial_triton(x, geometry)
+        elif self._use_packed_fast_path:
+            out = self._forward_spatial_packed(x, geometry)
+        else:
+            out = self._forward_spatial_blockwise(x, geometry)
+        if self.self_mixing is not None:
+            mixed = record_region_call("op/conv.self_mixing", self.self_mixing, x)
+            out = out + mixed
         return out
 
     def _triton_unsupported_reason(self, x: Tensor, geometry: _IrrepConvGeometry) -> str | None:
-        if self.quadrature or not self._regular_weights:
-            return "Triton backend only supports regular packed quadrature=False convolutions"
-        return triton_support_reason(x, self.packed_weight, self.in_type.max_order, self.out_type.max_order)
-
+        del geometry
+        if self.quadrature:
+            return "Triton backend only supports quadrature=False convolutions"
+        if self._regular_weights:
+            return triton_support_reason(
+                x,
+                self.packed_weight,
+                self.in_type.max_order,
+                self.out_type.max_order,
+            )
+        for out_order in self._out_orders:
+            for in_order in self._in_orders:
+                reason = irregular_pair_support_reason(
+                    x,
+                    self._weight_block(out_order, in_order),
+                    in_order,
+                    out_order,
+                )
+                if reason is not None:
+                    return reason
+        return None
+    
     def _should_use_triton(self, x: Tensor, geometry: _IrrepConvGeometry) -> bool:
         if self.backend == "torch":
             return False
@@ -958,6 +1015,10 @@ class IrrepSphereConv(_RadialBasisConvBase):
                 raise RuntimeError(reason)
             return False
         if self.backend == "triton":
+            return True
+        # The irregular path is memory-first: use it for every supported CUDA
+        # invocation instead of materializing blockwise edge activations.
+        if not self._regular_weights:
             return True
         workload = int(x.shape[0]) * int(geometry.neighbor_idx.numel()) * self.out_type.total_dim
         major, _minor = torch.cuda.get_device_capability(x.device)
@@ -970,30 +1031,75 @@ class IrrepSphereConv(_RadialBasisConvBase):
         return workload >= threshold
 
     def _forward_spatial_triton(self, x: Tensor, geometry: _IrrepConvGeometry) -> Tensor:
+        if not self._regular_weights:
+            return self._forward_spatial_irregular_triton(x, geometry)
         assert geometry.radial_basis is not None
         major, _minor = torch.cuda.get_device_capability(x.device)
         allow_tf32 = bool(major >= 8 and torch.backends.cuda.matmul.allow_tf32)
-        with record_region("op/conv.triton_fused"):
-            return packed_irrep_conv(
-                x,
-                self.packed_weight,
-                geometry.triton_center_idx,
-                geometry.triton_neighbor_idx,
-                geometry.center_ptr,
-                geometry.neighbor_ptr,
-                geometry.edges_by_neighbor,
-                geometry.radial_basis,
-                geometry.input_rotation_cos,
-                geometry.input_rotation_sin,
-                geometry.output_rotation_cos,
-                geometry.output_rotation_sin,
-                self._triton_input_pack_index,
-                self._triton_output_pack_index,
-                geometry.neighbor_count,
-                geometry.degree_bucket,
-                self.normalize_by_neighbors,
-                allow_tf32,
-            )
+        return record_region_call(
+            "op/conv.triton_fused",
+            packed_irrep_conv,
+            x,
+            self.packed_weight,
+            geometry.triton_center_idx,
+            geometry.triton_neighbor_idx,
+            geometry.center_ptr,
+            geometry.neighbor_ptr,
+            geometry.edges_by_neighbor,
+            geometry.radial_basis,
+            geometry.input_rotation_cos,
+            geometry.input_rotation_sin,
+            geometry.output_rotation_cos,
+            geometry.output_rotation_sin,
+            self._triton_input_pack_index,
+            self._triton_output_pack_index,
+            geometry.neighbor_count,
+            geometry.degree_bucket,
+            self.normalize_by_neighbors,
+            allow_tf32,
+        )
+
+    def _forward_spatial_irregular_triton(
+        self,
+        x: Tensor,
+        geometry: _IrrepConvGeometry,
+    ) -> Tensor:
+        """Run one fused, edge-free Triton op per active order pair."""
+
+        assert geometry.radial_basis is not None
+        major, _minor = torch.cuda.get_device_capability(x.device)
+        allow_tf32 = bool(major >= 8 and torch.backends.cuda.matmul.allow_tf32)
+        outputs_by_order: list[Tensor] = []
+        for out_order in self._out_orders:
+            out_block: Tensor | None = None
+            for in_order in self._in_orders:
+                pair = irregular_irrep_pair_conv(
+                    _irrep_block(x, self.in_type, in_order),
+                    self._weight_block(out_order, in_order),
+                    geometry.triton_center_idx,
+                    geometry.triton_neighbor_idx,
+                    geometry.center_ptr,
+                    geometry.neighbor_ptr,
+                    geometry.edges_by_neighbor,
+                    geometry.radial_basis,
+                    geometry.input_rotation_cos,
+                    geometry.input_rotation_sin,
+                    geometry.single_radial_input_cos,
+                    geometry.single_radial_input_sin,
+                    geometry.output_rotation_cos,
+                    geometry.output_rotation_sin,
+                    geometry.neighbor_count,
+                    in_order,
+                    out_order,
+                    geometry.degree_bucket,
+                    self.normalize_by_neighbors,
+                    self._irregular_r1_fast_path,
+                    allow_tf32,
+                )
+                out_block = pair if out_block is None else out_block + pair
+            assert out_block is not None
+            outputs_by_order.append(_flatten_irrep_block(out_block))
+        return torch.cat(outputs_by_order, dim=-1)
 
     def _forward_spatial_packed(self, x: Tensor, geometry: _IrrepConvGeometry) -> Tensor:
         """Regular convolution with one packed gather/scatter edge pipeline."""
@@ -1001,58 +1107,73 @@ class IrrepSphereConv(_RadialBasisConvBase):
         batch = int(x.shape[0])
         in_m = self.in_type.multiplicity(0)
         in_dim = 2 * self.in_type.max_order + 1
-        with record_region("op/conv.pack"):
-            packed = x.index_select(-1, self._input_pack_index).reshape(
-                batch,
-                geometry.n_points,
-                in_m,
-                in_dim,
-            )
-        with record_region("op/conv.gather"):
-            x_q = packed[:, geometry.neighbor_idx, :, :]
+        packed = record_region_call(
+            "op/conv.pack",
+            _pack_irrep_field,
+            x,
+            self._input_pack_index,
+            batch,
+            geometry.n_points,
+            in_m,
+            in_dim,
+        )
+        x_q = record_region_call(
+            "op/conv.gather", _gather_irrep_neighbors, packed, geometry.neighbor_idx
+        )
         assert geometry.radial_basis is not None
-        with record_region("op/conv.input_rotation"):
-            if self.num_radial == 1:
-                x_q = _rotate_single_radial_packed_irrep_field(
-                    x_q,
-                    geometry.single_radial_input_cos,
-                    geometry.single_radial_input_sin,
-                    geometry.radial_basis[:, 0],
-                )
-            else:
-                x_q = _rotate_packed_irrep_field_from_components(
-                    x_q,
-                    geometry.input_rotation_cos,
-                    geometry.input_rotation_sin,
-                )
+        if self.num_radial == 1:
+            x_q = record_region_call(
+                "op/conv.input_rotation",
+                _rotate_single_radial_packed_irrep_field,
+                x_q,
+                geometry.single_radial_input_cos,
+                geometry.single_radial_input_sin,
+                geometry.radial_basis[:, 0],
+            )
+        else:
+            x_q = record_region_call(
+                "op/conv.input_rotation",
+                _rotate_packed_irrep_field_from_components,
+                x_q,
+                geometry.input_rotation_cos,
+                geometry.input_rotation_sin,
+            )
         weight = self.packed_weight
         if weight.device != x.device or weight.dtype != x.dtype:
             weight = weight.to(device=x.device, dtype=x.dtype)
-        with record_region("op/conv.weight_einsum"):
-            weighted = torch.einsum("roaid,beid->beroa", weight, x_q)
-        with record_region("op/conv.radial_einsum"):
-            if self.num_radial == 1:
-                contrib = weighted.squeeze(2)
-            else:
-                contrib = torch.einsum("er,beroa->beoa", geometry.radial_basis, weighted)
-        with record_region("op/conv.output_rotation"):
-            contrib = _rotate_packed_irrep_field_from_components(
-                contrib,
-                geometry.output_rotation_cos,
-                geometry.output_rotation_sin,
+        weighted = record_region_call(
+            "op/conv.weight_einsum", torch.einsum, "roaid,beid->beroa", weight, x_q
+        )
+        if self.num_radial == 1:
+            contrib = record_region_call("op/conv.radial_einsum", torch.squeeze, weighted, 2)
+        else:
+            contrib = record_region_call(
+                "op/conv.radial_einsum",
+                torch.einsum,
+                "er,beroa->beoa",
+                geometry.radial_basis,
+                weighted,
             )
-        with record_region("op/conv.scatter"):
-            out = _scatter_to_centers(
-                contrib,
-                geometry.center_idx,
-                geometry.n_points,
-                geometry.neighbor_count,
-                normalize_by_neighbors=self.normalize_by_neighbors,
-                edge_weight=None,
-            )
-        with record_region("op/conv.unpack"):
-            flat_packed = out.flatten(start_dim=-2)
-            return flat_packed.index_select(-1, self._output_unpack_index)
+        contrib = record_region_call(
+            "op/conv.output_rotation",
+            _rotate_packed_irrep_field_from_components,
+            contrib,
+            geometry.output_rotation_cos,
+            geometry.output_rotation_sin,
+        )
+        out = record_region_call(
+            "op/conv.scatter",
+            _scatter_to_centers,
+            contrib,
+            geometry.center_idx,
+            geometry.n_points,
+            geometry.neighbor_count,
+            normalize_by_neighbors=self.normalize_by_neighbors,
+            edge_weight=None,
+        )
+        return record_region_call(
+            "op/conv.unpack", _unpack_irrep_field, out, self._output_unpack_index
+        )
 
     def _forward_spatial_blockwise(self, x: Tensor, geometry: _IrrepConvGeometry) -> Tensor:
         """Reference path for irregular, scalar-only, and quadrature convolutions."""
@@ -1060,8 +1181,12 @@ class IrrepSphereConv(_RadialBasisConvBase):
         inputs_by_order: dict[int, Tensor] = {}
         for in_order in self._in_orders:
             in_block = _irrep_block(x, self.in_type, in_order)
-            with record_region("op/conv.blockwise_gather"):
-                x_q = in_block[:, geometry.neighbor_idx, :, :]
+            x_q = record_region_call(
+                "op/conv.blockwise_gather",
+                _gather_irrep_neighbors,
+                in_block,
+                geometry.neighbor_idx,
+            )
             if not self.quadrature:
                 assert geometry.radial_basis is not None
                 if self.num_radial == 1:
@@ -1088,23 +1213,33 @@ class IrrepSphereConv(_RadialBasisConvBase):
                     weight = weight.to(device=x.device, dtype=x.dtype)
                 if self.quadrature:
                     basis = geometry.quadrature_bases[out_order, in_order]
-                    with record_region("op/conv.quadrature_einsum"):
-                        kernel = torch.einsum("erabcd,roibc->eoiad", basis, weight)
-                        contrib = torch.einsum("eoiad,beid->beoa", kernel, x_q)
+                    contrib = record_region_call(
+                        "op/conv.quadrature_einsum",
+                        _quadrature_contribution,
+                        basis,
+                        weight,
+                        x_q,
+                    )
                     normalize_by_neighbors = False
                 else:
                     assert geometry.radial_basis is not None
-                    with record_region("op/conv.blockwise_weight_einsum"):
-                        weighted = torch.einsum("roiad,beid->beroa", weight, x_q)
+                    weighted = record_region_call(
+                        "op/conv.blockwise_weight_einsum",
+                        torch.einsum,
+                        "roiad,beid->beroa",
+                        weight,
+                        x_q,
+                    )
                     if self.num_radial == 1:
                         contrib = weighted.squeeze(2)
                     else:
-                        with record_region("op/conv.blockwise_radial_einsum"):
-                            contrib = torch.einsum(
-                                "er,beroa->beoa",
-                                geometry.radial_basis,
-                                weighted,
-                            )
+                        contrib = record_region_call(
+                            "op/conv.blockwise_radial_einsum",
+                            torch.einsum,
+                            "er,beroa->beoa",
+                            geometry.radial_basis,
+                            weighted,
+                        )
 
                     if out_order > 0:
                         cos_value = geometry.output_rotation_cos[:, out_order - 1]
@@ -1115,15 +1250,17 @@ class IrrepSphereConv(_RadialBasisConvBase):
                             sin_value,
                         )
                     normalize_by_neighbors = self.normalize_by_neighbors
-                with record_region("op/conv.blockwise_scatter"):
-                    out_block = out_block + _scatter_to_centers(
-                        contrib,
-                        geometry.center_idx,
-                        geometry.n_points,
-                        geometry.neighbor_count,
-                        normalize_by_neighbors=normalize_by_neighbors,
-                        edge_weight=None,
-                    )
+                scattered = record_region_call(
+                    "op/conv.blockwise_scatter",
+                    _scatter_to_centers,
+                    contrib,
+                    geometry.center_idx,
+                    geometry.n_points,
+                    geometry.neighbor_count,
+                    normalize_by_neighbors=normalize_by_neighbors,
+                    edge_weight=None,
+                )
+                out_block = out_block + scattered
             outputs_by_order.append(_flatten_irrep_block(out_block))
 
         out = torch.cat(outputs_by_order, dim=-1)
@@ -1162,31 +1299,33 @@ class IrrepBatchNorm(nn.Module):
             raise ValueError("x must have shape [B, N, C]")
         if int(x.shape[-1]) != self.field_type.total_dim:
             raise ValueError(f"expected {self.field_type.total_dim} channels, got {int(x.shape[-1])}")
-        with record_region("op/batch_norm"):
-            outputs = []
-            for order in self.field_type.orders:
-                block = _irrep_block(x, self.field_type, order)
-                if order == 0:
-                    if self.scalar_bn is None:
-                        outputs.append(_flatten_irrep_block(block))
-                    else:
-                        batch, points, multiplicity, _dim = block.shape
-                        normalized = self.scalar_bn(block.reshape(batch * points, multiplicity))
-                        outputs.append(normalized.reshape(batch, points, multiplicity))
-                    continue
-                var = block.square().mean(dim=(0, 1, 3))
-                running_var = getattr(self, f"running_var_{order}")
-                if self.training:
-                    running_var.mul_(1.0 - self.momentum).add_(self.momentum * var.detach())
-                    used_var = var
+        return record_region_call("op/batch_norm", self._forward_impl, x)
+
+    def _forward_impl(self, x: Tensor) -> Tensor:
+        outputs = []
+        for order in self.field_type.orders:
+            block = _irrep_block(x, self.field_type, order)
+            if order == 0:
+                if self.scalar_bn is None:
+                    outputs.append(_flatten_irrep_block(block))
                 else:
-                    used_var = running_var.to(device=x.device, dtype=x.dtype)
-                scale = torch.rsqrt(used_var.to(device=x.device, dtype=x.dtype).clamp_min(self.eps))
-                weight = getattr(self, f"weight_{order}")
-                if weight is not None:
-                    scale = scale * weight.to(device=x.device, dtype=x.dtype)
-                outputs.append(_flatten_irrep_block(block * scale.view(1, 1, -1, 1)))
-            return torch.cat(outputs, dim=-1)
+                    batch, points, multiplicity, _dim = block.shape
+                    normalized = self.scalar_bn(block.reshape(batch * points, multiplicity))
+                    outputs.append(normalized.reshape(batch, points, multiplicity))
+                continue
+            var = block.square().mean(dim=(0, 1, 3))
+            running_var = getattr(self, f"running_var_{order}")
+            if self.training:
+                running_var.mul_(1.0 - self.momentum).add_(self.momentum * var.detach())
+                used_var = var
+            else:
+                used_var = running_var.to(device=x.device, dtype=x.dtype)
+            scale = torch.rsqrt(used_var.to(device=x.device, dtype=x.dtype).clamp_min(self.eps))
+            weight = getattr(self, f"weight_{order}")
+            if weight is not None:
+                scale = scale * weight.to(device=x.device, dtype=x.dtype)
+            outputs.append(_flatten_irrep_block(block * scale.view(1, 1, -1, 1)))
+        return torch.cat(outputs, dim=-1)
 
 
 class RegularNonlinearity(nn.Module):
@@ -1218,19 +1357,48 @@ class RegularNonlinearity(nn.Module):
         multiplicity = self.field_type.multiplicity(0)
         cos_table = self.cos_table.to(device=x.device, dtype=x.dtype)
         sin_table = self.sin_table.to(device=x.device, dtype=x.dtype)
-        with record_region("op/activation.reconstruct"):
-            samples = _irrep_block(x, self.field_type, 0).squeeze(-1).unsqueeze(-1)
-            for order in range(1, self.field_type.max_order + 1):
-                block = _irrep_block(x, self.field_type, order)
-                samples = samples + block[..., 0].unsqueeze(-1) * cos_table[order].view(1, 1, 1, -1)
-                samples = samples + block[..., 1].unsqueeze(-1) * sin_table[order].view(1, 1, 1, -1)
-        with record_region("op/activation.relu"):
-            activated = torch.relu(samples)
-        with record_region("op/activation.project"):
-            outputs = [activated.mean(dim=-1)]
-            factor = 2.0 / float(self.regular_samples)
-            for order in range(1, self.field_type.max_order + 1):
-                coeff_cos = factor * torch.sum(activated * cos_table[order].view(1, 1, 1, -1), dim=-1)
-                coeff_sin = factor * torch.sum(activated * sin_table[order].view(1, 1, 1, -1), dim=-1)
-                outputs.append(torch.stack((coeff_cos, coeff_sin), dim=-1).reshape(*x.shape[:-1], multiplicity * 2))
-            return torch.cat(outputs, dim=-1)
+        samples = record_region_call(
+            "op/activation.reconstruct", self._reconstruct, x, cos_table, sin_table
+        )
+        activated = record_region_call("op/activation.relu", torch.relu, samples)
+        return record_region_call(
+            "op/activation.project",
+            self._project,
+            x,
+            activated,
+            cos_table,
+            sin_table,
+            multiplicity,
+        )
+
+    def _reconstruct(self, x: Tensor, cos_table: Tensor, sin_table: Tensor) -> Tensor:
+        samples = _irrep_block(x, self.field_type, 0).squeeze(-1).unsqueeze(-1)
+        for order in range(1, self.field_type.max_order + 1):
+            block = _irrep_block(x, self.field_type, order)
+            samples = samples + block[..., 0].unsqueeze(-1) * cos_table[order].view(1, 1, 1, -1)
+            samples = samples + block[..., 1].unsqueeze(-1) * sin_table[order].view(1, 1, 1, -1)
+        return samples
+
+    def _project(
+        self,
+        x: Tensor,
+        activated: Tensor,
+        cos_table: Tensor,
+        sin_table: Tensor,
+        multiplicity: int,
+    ) -> Tensor:
+        outputs = [activated.mean(dim=-1)]
+        factor = 2.0 / float(self.regular_samples)
+        for order in range(1, self.field_type.max_order + 1):
+            coeff_cos = factor * torch.sum(
+                activated * cos_table[order].view(1, 1, 1, -1), dim=-1
+            )
+            coeff_sin = factor * torch.sum(
+                activated * sin_table[order].view(1, 1, 1, -1), dim=-1
+            )
+            outputs.append(
+                torch.stack((coeff_cos, coeff_sin), dim=-1).reshape(
+                    *x.shape[:-1], multiplicity * 2
+                )
+            )
+        return torch.cat(outputs, dim=-1)

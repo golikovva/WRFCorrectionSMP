@@ -1,6 +1,7 @@
 # FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
 # FROM pytorch/pytorch:2.9.1-cuda12.6-cudnn9-devel
-FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
+# FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
 
 # Set non-interactive installation to avoid timezone prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,11 +11,13 @@ ENV TZ=UTC
 ENV CUDA_HOME=/usr/local/cuda
 ENV FORCE_CUDA_EXTENSION=1
 # ENV TORCH_CUDA_ARCH_LIST="7.0 7.2 7.5 8.0 8.6 8.7 9.0 10.0+PTX"
-ENV TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 8.9+PTX"
+ENV TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 8.9 9.0+PTX"
 ENV TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
 ENV CMAKE_PREFIX_PATH=/opt/conda
 ENV USE_CUDA=1
 ENV USE_CUDNN=1
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -57,6 +60,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
     basemap \
     cartopy \
     einops \
+    opt_einsum \
+    pytest \
+    ipykernel \
     geopandas 
 
 # Install transformers with a version compatible with PyTorch 2.1
@@ -73,8 +79,8 @@ RUN pip install --no-cache-dir \
     cython
 
 # Install KNN_CUDA
-RUN pip install --upgrade --no-cache-dir \
-    https://github.com/unlimblue/KNN_CUDA/releases/download/0.2/KNN_CUDA-0.2-py3-none-any.whl
+# RUN pip install --upgrade --no-cache-dir \
+#     https://github.com/unlimblue/KNN_CUDA/releases/download/0.2/KNN_CUDA-0.2-py3-none-any.whl
 
 # Install PointNet2 ops
 # RUN pip install --no-build-isolation --no-cache-dir \
@@ -90,6 +96,9 @@ RUN pip install --no-cache-dir microsoft-aurora
 # Verify PyTorch compilation capabilities
 
 RUN pip install --no-cache-dir clearml
+
+ENV LD_PRELOAD=/opt/conda/lib/libgomp.so.1
+
 ENV CLEARML_API_HOST=https://api.ml.hybrid-modelling.appliedai.tech
 ENV CLEARML_WEB_HOST=https://app.ml.hybrid-modelling.appliedai.tech
 ENV CLEARML_FILES_HOST=https://files.ml.hybrid-modelling.appliedai.tech
@@ -108,7 +117,7 @@ EXPOSE 9999
 ENV NAME vgolikovwrf
 
 # Copy source code
-COPY . /home
+# COPY . /home
 
 # Set working directory
 WORKDIR /home/experiments/train_test
