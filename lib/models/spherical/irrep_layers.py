@@ -20,6 +20,11 @@ from .triton_irrep_conv import (
     packed_irrep_conv,
     triton_support_reason,
 )
+from .triton_semi_packed_irrep_conv import (
+    semi_packed_irrep_conv,
+    semi_packed_support_reason,
+    should_use_semi_packed,
+)
 from .triton_irregular_irrep_conv import (
     irregular_irrep_pair_conv,
     irregular_pair_support_reason,
@@ -87,7 +92,14 @@ def _pack_irrep_field(
 
 
 def _gather_irrep_neighbors(x: Tensor, neighbor_idx: Tensor) -> Tensor:
-    return x[:, neighbor_idx, :, :]
+    # ``x[:, neighbor_idx, ...]`` goes through advanced-index validation in
+    # TorchDynamo.  With a CUDA index tensor that validation reads a scalar
+    # from the device (``aten._local_scalar_dense``), which makes the packed
+    # and blockwise reference paths incompatible with ``fullgraph=True``.
+    # This gather is exactly an index-select along the point dimension and
+    # index_select has the same forward/backward semantics without the graph
+    # break or a device synchronization.
+    return x.index_select(1, neighbor_idx)
 
 
 def _quadrature_contribution(basis: Tensor, weight: Tensor, x_q: Tensor) -> Tensor:
@@ -534,6 +546,8 @@ class IrrepSphereConv(_RadialBasisConvBase):
         quadrature_angular: int = 16,
         quadrature_sigma_km: float | None = None,
         backend: Literal["auto", "torch", "triton"] = "auto",
+        regular_r1_variant: Literal["auto", "fused", "semi_packed"] = "auto",
+        triton_workspace_mib: int = 512,
     ) -> None:
         super().__init__(
             radius_km,
@@ -553,6 +567,14 @@ class IrrepSphereConv(_RadialBasisConvBase):
         self.backend = str(backend)
         if self.backend not in ("auto", "torch", "triton"):
             raise ValueError("backend must be 'auto', 'torch', or 'triton'")
+        self.regular_r1_variant = str(regular_r1_variant)
+        if self.regular_r1_variant not in ("auto", "fused", "semi_packed"):
+            raise ValueError(
+                "regular_r1_variant must be 'auto', 'fused', or 'semi_packed'"
+            )
+        if isinstance(triton_workspace_mib, bool) or int(triton_workspace_mib) < 0:
+            raise ValueError("triton_workspace_mib must be a non-negative integer")
+        self.triton_workspace_mib = int(triton_workspace_mib)
         if self.quadrature_radial < 1:
             raise ValueError("quadrature_radial must be positive")
         if self.quadrature_angular < 1:
@@ -620,6 +642,13 @@ class IrrepSphereConv(_RadialBasisConvBase):
             else None
         )
         self.reset_parameters()
+
+    def __setstate__(self, state: dict) -> None:
+        """Load profiler payloads created before regular R1 controls existed."""
+
+        super().__setstate__(state)
+        self.__dict__.setdefault("regular_r1_variant", "auto")
+        self.__dict__.setdefault("triton_workspace_mib", 512)
 
     @staticmethod
     def _weight_key(out_order: int, in_order: int) -> str:
@@ -838,12 +867,15 @@ class IrrepSphereConv(_RadialBasisConvBase):
                 single_radial_input_sin = single_radial_input_sin.index_select(0, edge_order)
 
                 center_counts = torch.bincount(center_idx, minlength=graph.n_points).to(torch.int32)
-                max_degree = int(center_counts.max().item())
-                degree_bucket = max(8, 1 << max(0, max_degree - 1).bit_length())
                 center_ptr = torch.zeros(graph.n_points + 1, device=device, dtype=torch.int32)
                 center_ptr[1:] = torch.cumsum(center_counts, dim=0)
                 neighbor_order = torch.argsort(neighbor_idx, stable=True)
                 neighbor_counts = torch.bincount(neighbor_idx, minlength=graph.n_points).to(torch.int32)
+                max_degree = max(
+                    int(center_counts.max().item()),
+                    int(neighbor_counts.max().item()),
+                )
+                degree_bucket = max(8, 1 << max(0, max_degree - 1).bit_length())
                 neighbor_ptr = torch.zeros(graph.n_points + 1, device=device, dtype=torch.int32)
                 neighbor_ptr[1:] = torch.cumsum(neighbor_counts, dim=0)
                 triton_center_idx = center_idx.to(torch.int32)
@@ -984,16 +1016,25 @@ class IrrepSphereConv(_RadialBasisConvBase):
         return out
 
     def _triton_unsupported_reason(self, x: Tensor, geometry: _IrrepConvGeometry) -> str | None:
-        del geometry
         if self.quadrature:
             return "Triton backend only supports quadrature=False convolutions"
         if self._regular_weights:
-            return triton_support_reason(
+            reason = triton_support_reason(
                 x,
                 self.packed_weight,
                 self.in_type.max_order,
                 self.out_type.max_order,
             )
+            if reason is not None:
+                return reason
+            if self.num_radial == 1 and self.regular_r1_variant == "semi_packed":
+                return semi_packed_support_reason(
+                    x,
+                    self.packed_weight,
+                    geometry.degree_bucket,
+                    self.triton_workspace_mib << 20,
+                )
+            return None
         for out_order in self._out_orders:
             for in_order in self._in_orders:
                 reason = irregular_pair_support_reason(
@@ -1036,6 +1077,31 @@ class IrrepSphereConv(_RadialBasisConvBase):
         assert geometry.radial_basis is not None
         major, _minor = torch.cuda.get_device_capability(x.device)
         allow_tf32 = bool(major >= 8 and torch.backends.cuda.matmul.allow_tf32)
+        variant = self._selected_regular_r1_variant(x, geometry)
+        if variant == "semi_packed":
+            return record_region_call(
+                "op/conv.triton_semi_packed",
+                semi_packed_irrep_conv,
+                x,
+                self.packed_weight,
+                geometry.triton_center_idx,
+                geometry.triton_neighbor_idx,
+                geometry.center_ptr,
+                geometry.neighbor_ptr,
+                geometry.edges_by_neighbor,
+                geometry.radial_basis,
+                geometry.input_rotation_cos,
+                geometry.input_rotation_sin,
+                geometry.output_rotation_cos,
+                geometry.output_rotation_sin,
+                self._triton_input_pack_index,
+                self._triton_output_pack_index,
+                geometry.neighbor_count,
+                geometry.degree_bucket,
+                self.normalize_by_neighbors,
+                allow_tf32,
+                self.triton_workspace_mib << 20,
+            )
         return record_region_call(
             "op/conv.triton_fused",
             packed_irrep_conv,
@@ -1058,6 +1124,35 @@ class IrrepSphereConv(_RadialBasisConvBase):
             self.normalize_by_neighbors,
             allow_tf32,
         )
+
+    def _selected_regular_r1_variant(
+        self,
+        x: Tensor,
+        geometry: _IrrepConvGeometry,
+    ) -> Literal["fused", "semi_packed"]:
+        """Resolve the regular R1 implementation without synchronizing CUDA."""
+
+        if self.num_radial != 1 or not self._regular_weights:
+            return "fused"
+        if self.regular_r1_variant == "fused":
+            return "fused"
+        workspace_bytes = self.triton_workspace_mib << 20
+        reason = semi_packed_support_reason(
+            x, self.packed_weight, geometry.degree_bucket, workspace_bytes,
+        )
+        if self.regular_r1_variant == "semi_packed":
+            if reason is not None:
+                raise RuntimeError(reason)
+            return "semi_packed"
+        if reason is None and should_use_semi_packed(
+            x, self.packed_weight, geometry.degree_bucket, workspace_bytes,
+            training=(
+                torch.is_grad_enabled()
+                and (x.requires_grad or self.packed_weight.requires_grad)
+            ),
+        ):
+            return "semi_packed"
+        return "fused"
 
     def _forward_spatial_irregular_triton(
         self,

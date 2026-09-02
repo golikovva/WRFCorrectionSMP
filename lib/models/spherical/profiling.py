@@ -368,8 +368,19 @@ class ConvolutionComparison:
             raise RuntimeError("no convolution cases were captured; call profiler.profile() first")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         rows: list[dict[str, Any]] = []
-        for case in self.cases:
-            rows.extend(self._run_case(case, include_backward=include_backward))
+        # Every captured shape specializes the same two Python call sites used
+        # by the compiled Torch baselines below.  Forward and training also
+        # need separate variants because ``requires_grad`` is guarded, so a
+        # U-Net easily exceeds TorchDynamo's default per-code-object cache
+        # limit (8).  Raise the limit only for this benchmark and restore it
+        # on exit through the config patch context manager.
+        compile_cache_limit = max(
+            int(torch._dynamo.config.cache_size_limit),
+            2 * len(self.cases) + 2,
+        )
+        with torch._dynamo.config.patch(cache_size_limit=compile_cache_limit):
+            for case in self.cases:
+                rows.extend(self._run_case(case, include_backward=include_backward))
         self.table = pd.DataFrame(rows)
         self.table.to_csv(self.output_dir / "backend_comparison.csv", index=False)
         return self.table
@@ -385,6 +396,14 @@ class ConvolutionComparison:
         }
         if module._use_packed_fast_path:
             paths["packed"] = lambda x: module._forward_spatial_packed(x, geometry)
+        for path_name in ("blockwise", "packed"):
+            eager_path = paths.get(path_name)
+            if eager_path is not None:
+                paths[f"{path_name}_compiled"] = torch.compile(
+                    eager_path,
+                    fullgraph=True,
+                    dynamic=False,
+                )
         reason = module._triton_unsupported_reason(x_base, geometry)
         if reason is None:
             def irregular_triton(x: Tensor, *, fast_path: bool) -> Tensor:
@@ -399,6 +418,28 @@ class ConvolutionComparison:
                 paths["triton_legacy"] = lambda x: irregular_triton(
                     x, fast_path=False,
                 )
+            if module._regular_weights and module.num_radial == 1:
+                def regular_triton(x: Tensor, *, variant: str) -> Tensor:
+                    previous = module.regular_r1_variant
+                    module.regular_r1_variant = variant
+                    try:
+                        return module._forward_spatial_triton(x, geometry)
+                    finally:
+                        module.regular_r1_variant = previous
+
+                paths["triton_fused"] = lambda x: regular_triton(
+                    x, variant="fused",
+                )
+                previous_variant = module.regular_r1_variant
+                module.regular_r1_variant = "semi_packed"
+                try:
+                    semi_reason = module._triton_unsupported_reason(x_base, geometry)
+                finally:
+                    module.regular_r1_variant = previous_variant
+                if semi_reason is None:
+                    paths["triton_semi_packed"] = lambda x: regular_triton(
+                        x, variant="semi_packed",
+                    )
             paths["triton"] = lambda x: module._forward_spatial_triton(x, geometry)
         reference_name = "packed" if "packed" in paths else "blockwise"
         reference = paths[reference_name](x_base).detach()
@@ -429,23 +470,52 @@ class ConvolutionComparison:
             )
         original_grads = tuple(parameter.grad for parameter in weight_parameters)
         rows = []
+
+        def profiled_regular_variant(
+            path_name: str,
+            *,
+            training: bool = False,
+        ) -> str | None:
+            if path_name in ("triton_fused", "triton_semi_packed"):
+                return path_name.removeprefix("triton_")
+            if (
+                path_name == "triton"
+                and module._regular_weights
+                and module.num_radial == 1
+            ):
+                if training:
+                    probe = x_base.detach().requires_grad_(True)
+                    return module._selected_regular_r1_variant(probe, geometry)
+                with torch.inference_mode():
+                    return module._selected_regular_r1_variant(x_base, geometry)
+            return None
+
         try:
             for path_name, path in paths.items():
                 try:
-                    actual = path(x_base).detach()
+                    with torch.inference_mode():
+                        actual = path(x_base).detach()
                     delta = (actual.float() - reference.float()).abs()
                     close = torch.allclose(
                         actual, reference,
                         atol=_dtype_tolerance(case.dtype, self.config.correctness_atol),
                         rtol=_dtype_tolerance(case.dtype, self.config.correctness_rtol),
                     )
+                    def forward_step() -> Tensor:
+                        with torch.inference_mode():
+                            return path(x_base)
+
                     forward = _measure_cuda(
-                        lambda: path(x_base), self.config.micro_warmup,
+                        forward_step, self.config.micro_warmup,
                         self.config.micro_iterations, self.config.micro_repeats,
                     )
                     rows.append({
                         "module": case.name, "input_shape": case.shape, "path": path_name,
                         "mode": "forward", "median_ms": forward[0], "peak_cuda_mib": forward[1],
+                        "regular_r1_variant": profiled_regular_variant(path_name),
+                        "workspace_limit_mib": (
+                            module.triton_workspace_mib if path_name.startswith("triton") else None
+                        ),
                         "correct": bool(close), "max_abs_error": float(delta.max()),
                         "grad_x_correct": None, "grad_weight_correct": None,
                         "grad_x_max_abs_error": None, "grad_weight_max_abs_error": None,
@@ -512,6 +582,12 @@ class ConvolutionComparison:
                             "module": case.name, "input_shape": case.shape, "path": path_name,
                             "mode": "forward+backward", "median_ms": backward[0],
                             "peak_cuda_mib": backward[1],
+                            "regular_r1_variant": profiled_regular_variant(
+                                path_name, training=True,
+                            ),
+                            "workspace_limit_mib": (
+                                module.triton_workspace_mib if path_name.startswith("triton") else None
+                            ),
                             "correct": bool(close and grad_x_close is not False and grad_weight_close is not False),
                             "max_abs_error": float(delta.max()),
                             "grad_x_correct": grad_x_close,
@@ -544,7 +620,7 @@ class ConvolutionComparison:
         return rows
 
     def export_nsight_cases(self) -> list[Path]:
-        """Serialize one standalone Triton workload per captured signature."""
+        """Serialize isolated production and forced Triton workloads."""
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         paths = []
@@ -552,32 +628,55 @@ class ConvolutionComparison:
             probe = torch.empty(case.shape, device=case.device, dtype=case.dtype)
             if case.module._triton_unsupported_reason(probe, case.geometry) is not None:
                 continue
-            payload_path = self.output_dir / f"case_{index:02d}_{_slug(case.name)}.pt"
-            prepared_geometry = case.module._prepared_geometry
-            case.module._prepared_geometry = None
-            try:
-                module_copy = copy.deepcopy(case.module)
-            finally:
-                case.module._prepared_geometry = prepared_geometry
-            module_copy.clear_prepared_graph()
-            module_copy = module_copy.cpu()
-            module_copy.__dict__.pop("_irrep_profile_capture", None)
-            geometry_copy = _geometry_to(case.geometry, torch.device("cpu"), case.dtype)
-            torch.save(
-                {
-                    "module": module_copy, "geometry": geometry_copy,
-                    "shape": case.shape, "dtype": str(case.dtype),
-                },
-                payload_path,
-            )
-            paths.append(payload_path)
+            variants = ["configured"]
+            if case.module._regular_weights and case.module.num_radial == 1:
+                variants.extend(("fused", "semi_packed"))
+            for variant in variants:
+                payload_path = self.output_dir / (
+                    f"case_{index:02d}_{_slug(case.name)}_{variant}.pt"
+                )
+                prepared_geometry = case.module._prepared_geometry
+                case.module._prepared_geometry = None
+                try:
+                    module_copy = copy.deepcopy(case.module)
+                finally:
+                    case.module._prepared_geometry = prepared_geometry
+                module_copy.clear_prepared_graph()
+                if variant != "configured":
+                    module_copy.regular_r1_variant = variant
+                module_copy = module_copy.cpu()
+                module_copy.__dict__.pop("_irrep_profile_capture", None)
+                geometry_copy = _geometry_to(case.geometry, torch.device("cpu"), case.dtype)
+                if variant == "semi_packed":
+                    module_copy.regular_r1_variant = "semi_packed"
+                    check = module_copy.triton_workspace_mib << 20
+                    bytes_per_point = (
+                        int(case.shape[0])
+                        * case.geometry.degree_bucket
+                        * (
+                            int(module_copy.packed_weight.shape[1] * module_copy.packed_weight.shape[2])
+                            + int(module_copy.packed_weight.shape[3] * module_copy.packed_weight.shape[4])
+                        )
+                        * torch.tensor([], dtype=case.dtype).element_size()
+                    )
+                    if check <= bytes_per_point:
+                        continue
+                torch.save(
+                    {
+                        "module": module_copy, "geometry": geometry_copy,
+                        "shape": case.shape, "dtype": str(case.dtype),
+                        "regular_r1_variant": variant,
+                    },
+                    payload_path,
+                )
+                paths.append(payload_path)
         return paths
 
     def run_nsight(
         self,
         *,
         preset: Literal["quick", "full"] = "quick",
-        mode: Literal["forward", "training"] = "forward",
+        mode: Literal["forward", "grad_input", "grad_weight", "training"] = "forward",
         timeout_seconds: int = 1800,
     ) -> pd.DataFrame:
         """Run Nsight Compute for each captured Triton case in isolated processes."""
@@ -596,6 +695,21 @@ class ConvolutionComparison:
         sections = ["LaunchStats", "Occupancy", "SpeedOfLight"]
         if preset == "full":
             sections.extend(["MemoryWorkloadAnalysis", "ComputeWorkloadAnalysis", "SchedulerStats"])
+        kernel_filters = {
+            "forward": (
+                "regex:(_packed_forward_r1_kernel|_transpose_weight_r1_kernel|"
+                "_gather_input_r1_kernel|"
+                "_semi_matmul_r1_kernel|_reduce_output_r1_kernel)"
+            ),
+            "grad_input": (
+                "regex:(_packed_grad_input_r1_kernel|_reduce_grad_input_r1_kernel)"
+            ),
+            "grad_weight": (
+                "regex:(_packed_grad_weight_r1_partial_kernel|"
+                "_reduce_grad_weight_partials_kernel|_grad_weight_matmul_r1_kernel|"
+                "_accumulate_grad_weight_kernel)"
+            ),
+        }
         for payload in payloads:
             report_path = payload.with_suffix(".ncu-rep")
             csv_path = payload.with_suffix(".ncu.csv")
@@ -605,6 +719,18 @@ class ConvolutionComparison:
             ]
             for section in sections:
                 command.extend(["--section", section])
+            if preset == "full":
+                command.extend([
+                    "--metrics",
+                    ",".join((
+                        "l1tex__t_sectors.sum",
+                        "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+                        "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+                        "dram__bytes.sum",
+                    )),
+                ])
+            if mode in kernel_filters:
+                command.extend(["--kernel-name", kernel_filters[mode]])
             command.extend([
                 sys.executable, "-m", "lib.models.spherical.profiling",
                 "--nsight-case", str(payload), "--nsight-mode", mode,
@@ -636,7 +762,7 @@ class ConvolutionComparison:
                     cwd=project_root, env=child_env,
                 )
                 csv_path.write_text(exported.stdout, encoding="utf-8")
-            rows.append({
+            row = {
                 "case": payload.name,
                 "status": status,
                 "report": str(report_path) if report_path.exists() else None,
@@ -645,9 +771,20 @@ class ConvolutionComparison:
                 "hint": hint,
                 "stdout": completed.stdout[-2000:],
                 "stderr": completed.stderr[-2000:],
-            })
+            }
+            if csv_path.exists():
+                row.update(self.summarize_nsight_csv(csv_path))
+            rows.append(row)
         table = pd.DataFrame(rows)
         table.to_csv(self.output_dir / "nsight_runs.csv", index=False)
+        summary_columns = [
+            "case", "status", "launches", "duration_ms", "sm_throughput_pct",
+            "active_warps_pct", "registers_per_thread", "fma_pipe_pct",
+            "tensor_pipe_pct", "l1_sectors", "dram_bytes",
+        ]
+        table.reindex(columns=summary_columns).to_csv(
+            self.output_dir / "nsight_summary.csv", index=False,
+        )
         return table
 
     @staticmethod
@@ -660,8 +797,203 @@ class ConvolutionComparison:
             None,
         )
         if start is None:
+            start = next(
+                (
+                    index for index, line in enumerate(lines)
+                    if line.startswith('"ID",') and "gpu__time_duration" in line
+                ),
+                None,
+            )
+        if start is None:
             return pd.DataFrame()
-        return pd.read_csv(StringIO("\n".join(lines[start:])), quoting=csv.QUOTE_MINIMAL)
+        table = pd.read_csv(StringIO("\n".join(lines[start:])), quoting=csv.QUOTE_MINIMAL)
+        if "Metric Name" not in table.columns and not table.empty:
+            units = {
+                column: str(table.iloc[0][column])
+                for column in table.columns
+                if pd.notna(table.iloc[0][column])
+            }
+            table = table[table["ID"].notna()].reset_index(drop=True)
+            table.attrs["metric_units"] = units
+        return table
+
+    @staticmethod
+    def summarize_nsight_csv(path: str | Path) -> dict[str, float | int | None]:
+        """Collapse raw NCU metrics into duration-weighted kernel indicators."""
+
+        table = ConvolutionComparison.read_nsight_csv(path)
+        empty = {
+            "launches": 0, "duration_ms": None, "sm_throughput_pct": None,
+            "active_warps_pct": None, "registers_per_thread": None,
+            "fma_pipe_pct": None, "tensor_pipe_pct": None,
+            "l1_sectors": None, "dram_bytes": None,
+        }
+        if table.empty:
+            return empty
+
+        if "Metric Name" not in table.columns:
+            def wide_number(column: str) -> pd.Series | None:
+                if column not in table.columns:
+                    return None
+                return pd.to_numeric(
+                    table[column].astype(str).str.replace(",", "", regex=False),
+                    errors="coerce",
+                )
+
+            duration = wide_number("gpu__time_duration.sum")
+            if duration is None:
+                weights = pd.Series(1.0, index=table.index)
+                duration_ms = None
+            else:
+                unit = table.attrs.get("metric_units", {}).get(
+                    "gpu__time_duration.sum", "msecond",
+                ).lower()
+                factor = (
+                    1e-6 if "nsecond" in unit or unit == "ns"
+                    else 1e-3 if "usecond" in unit or unit in ("us", "µs")
+                    else 1e3 if unit == "second"
+                    else 1.0
+                )
+                weights = duration.fillna(0.0) * factor
+                duration_ms = float(weights.sum())
+
+            def wide_weighted(*columns: str) -> float | None:
+                column = next((name for name in columns if name in table.columns), None)
+                if column is None:
+                    return None
+                series = wide_number(column)
+                assert series is not None
+                valid = series.notna() & weights.notna()
+                denominator = float(weights[valid].sum())
+                if not valid.any():
+                    return None
+                if denominator == 0.0:
+                    return float(series[valid].mean())
+                return float((series[valid] * weights[valid]).sum() / denominator)
+
+            def wide_sum(*columns: str) -> float | None:
+                column = next((name for name in columns if name in table.columns), None)
+                if column is None:
+                    return None
+                series = wide_number(column)
+                assert series is not None
+                if not series.notna().any():
+                    return None
+                value = float(series.sum())
+                if column == "dram__bytes.sum":
+                    unit = table.attrs.get("metric_units", {}).get(column, "byte").lower()
+                    if "kbyte" in unit:
+                        value *= 1e3
+                    elif "mbyte" in unit:
+                        value *= 1e6
+                    elif "gbyte" in unit:
+                        value *= 1e9
+                return value
+
+            return {
+                "launches": int(len(table)),
+                "duration_ms": duration_ms,
+                "sm_throughput_pct": wide_weighted(
+                    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+                ),
+                "active_warps_pct": wide_weighted(
+                    "sm__warps_active.avg.pct_of_peak_sustained_active",
+                ),
+                "registers_per_thread": wide_weighted("launch__registers_per_thread"),
+                "fma_pipe_pct": wide_weighted(
+                    "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed",
+                    "smsp__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed",
+                ),
+                "tensor_pipe_pct": wide_weighted(
+                    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
+                    "smsp__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
+                ),
+                "l1_sectors": wide_sum("l1tex__t_sectors.sum"),
+                "dram_bytes": wide_sum("dram__bytes.sum"),
+            }
+
+        required = {"Metric Name", "Metric Value"}
+        if not required.issubset(table.columns):
+            return empty
+
+        def number(value: Any) -> float | None:
+            try:
+                return float(str(value).replace(",", "").replace("%", "").strip())
+            except (TypeError, ValueError):
+                return None
+
+        values = table.copy()
+        values["_value"] = values["Metric Value"].map(number)
+        values = values[values["_value"].notna()]
+        id_columns = [
+            column for column in ("ID", "Kernel Name", "Kernel Time")
+            if column in values.columns
+        ]
+        if not id_columns:
+            values["_launch"] = values.index.astype(str)
+        else:
+            values["_launch"] = values[id_columns].astype(str).agg("|".join, axis=1)
+
+        duration_rows = values[
+            values["Metric Name"].astype(str).str.contains("gpu__time_duration", regex=False)
+        ].copy()
+        durations: dict[str, float] = {}
+        for _, item in duration_rows.iterrows():
+            duration = float(item["_value"])
+            unit = str(item.get("Metric Unit", "")).lower()
+            if "nsecond" in unit or unit == "ns":
+                duration /= 1e6
+            elif "usecond" in unit or unit in ("us", "µs"):
+                duration /= 1e3
+            elif "second" in unit and "msecond" not in unit:
+                duration *= 1e3
+            durations[str(item["_launch"])] = duration
+
+        def matching_metric(*needles: str) -> pd.DataFrame:
+            names = values["Metric Name"].astype(str)
+            mask = False
+            for needle in needles:
+                mask = mask | names.str.contains(needle, regex=False)
+            return values[mask]
+
+        def weighted(*needles: str) -> float | None:
+            rows = matching_metric(*needles)
+            if rows.empty:
+                return None
+            numerator = 0.0
+            denominator = 0.0
+            for _, item in rows.iterrows():
+                weight = durations.get(str(item["_launch"]), 1.0)
+                numerator += float(item["_value"]) * weight
+                denominator += weight
+            return numerator / denominator if denominator else None
+
+        def summed(*needles: str) -> float | None:
+            rows = matching_metric(*needles)
+            if rows.empty:
+                return None
+            return float(rows["_value"].sum())
+
+        launch_ids = set(values["_launch"].astype(str))
+        launch_ids.difference_update(duration_rows["_launch"].astype(str))
+        # Metric rows share one ID per launch; fall back to duration IDs when
+        # an exporter omits kernel-name columns.
+        launches = len(set(durations)) or len(launch_ids)
+        return {
+            "launches": launches,
+            "duration_ms": sum(durations.values()) if durations else None,
+            "sm_throughput_pct": weighted(
+                "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+            ),
+            "active_warps_pct": weighted(
+                "warps_active.avg.pct_of_peak_sustained_active",
+            ),
+            "registers_per_thread": weighted("launch__registers_per_thread"),
+            "fma_pipe_pct": weighted("pipe_fma_cycles_active"),
+            "tensor_pipe_pct": weighted("pipe_tensor_cycles_active"),
+            "l1_sectors": summed("l1tex__t_sectors.sum"),
+            "dram_bytes": summed("dram__bytes.sum"),
+        }
 
 
 def make_inference_step(model: nn.Module, *args: Any, **kwargs: Any) -> ProfileStep:
@@ -865,7 +1197,11 @@ def _run_nsight_case(path: Path, mode: str) -> None:
 def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--nsight-case", type=Path)
-    parser.add_argument("--nsight-mode", choices=("forward", "training"), default="forward")
+    parser.add_argument(
+        "--nsight-mode",
+        choices=("forward", "grad_input", "grad_weight", "training"),
+        default="forward",
+    )
     args = parser.parse_args()
     if args.nsight_case is None:
         parser.error("--nsight-case is required")

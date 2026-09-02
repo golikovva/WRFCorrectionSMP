@@ -142,6 +142,8 @@ class _IrrepSphereDoubleConv(nn.Module):
         quadrature_angular: int,
         quadrature_sigma_km: float | None,
         irrep_conv_backend: Literal["auto", "torch", "triton"],
+        regular_r1_variant: Literal["auto", "fused", "semi_packed"] = "auto",
+        triton_workspace_mib: int = 512,
     ) -> None:
         super().__init__()
         conv_kwargs = {
@@ -153,6 +155,8 @@ class _IrrepSphereDoubleConv(nn.Module):
             "quadrature_angular": quadrature_angular,
             "quadrature_sigma_km": quadrature_sigma_km,
             "backend": irrep_conv_backend,
+            "regular_r1_variant": regular_r1_variant,
+            "triton_workspace_mib": triton_workspace_mib,
         }
         self.in_type = in_type
         self.out_type = out_type
@@ -235,6 +239,8 @@ class IrrepSphereUNet(nn.Module):
         quadrature_angular: int = 16,
         quadrature_sigma_km: float | None = None,
         irrep_conv_backend: Literal["auto", "torch", "triton"] = "auto",
+        regular_r1_variant: Literal["auto", "fused", "semi_packed"] = "auto",
+        triton_workspace_mib: int = 512,
     ) -> None:
         super().__init__()
         widths = tuple(int(value) for value in multiplicities)
@@ -258,6 +264,8 @@ class IrrepSphereUNet(nn.Module):
         self.multiplicities = widths
         self.max_order = hidden_max_order
         self.irrep_conv_backend = str(irrep_conv_backend)
+        self.regular_r1_variant = str(regular_r1_variant)
+        self.triton_workspace_mib = int(triton_workspace_mib)
         self.level_types = tuple(
             SO2IrrepFieldType.balanced(hidden_max_order, width) for width in widths
         )
@@ -274,6 +282,8 @@ class IrrepSphereUNet(nn.Module):
             "quadrature_angular": quadrature_angular,
             "quadrature_sigma_km": quadrature_sigma_km,
             "irrep_conv_backend": irrep_conv_backend,
+            "regular_r1_variant": regular_r1_variant,
+            "triton_workspace_mib": triton_workspace_mib,
         }
         encoder_in_types = (in_type, *self.level_types[:-1])
         self.encoder_blocks = nn.ModuleList(

@@ -9,6 +9,7 @@ from torch.nn.utils.rnn import PackedSequence
 
 from lib.models.build_module import build_correction_model
 from lib.models.location_encoding import InputChannelAppender, SirenSHGridEncoder
+from lib.models.model import InputChannelSelector
 
 
 def make_grid(h=8, w=8):
@@ -18,8 +19,8 @@ def make_grid(h=8, w=8):
     return {"longitude": lon, "latitude": lat}
 
 
-def make_unet_cfg(base_channels=3, enabled=True, out_channels=2):
-    return SimpleNamespace(
+def make_unet_cfg(base_channels=3, enabled=True, out_channels=2, drop_first_channels=0):
+    cfg = SimpleNamespace(
         device="cpu",
         model_type="UNet",
         model_args=SimpleNamespace(
@@ -41,6 +42,11 @@ def make_unet_cfg(base_channels=3, enabled=True, out_channels=2):
             "w0_initial": 30.0,
         },
     )
+    if drop_first_channels:
+        cfg.model_input = {
+            "drop_first_channels": drop_first_channels,
+        }
+    return cfg
 
 
 def test_siren_sh_grid_encoder_shape_dtype_and_state_dict():
@@ -119,6 +125,44 @@ def test_unet_forward_backward_and_checkpoint_roundtrip():
 
     reloaded = build_correction_model(cfg, grid=grid)
     reloaded.load_state_dict(state_dict)
+
+
+def test_corrector_siren_and_input_selector_use_only_encoding_channels():
+    grid = make_grid(h=32, w=32)
+    cfg = make_unet_cfg(
+        base_channels=5,
+        enabled=True,
+        out_channels=2,
+        drop_first_channels=3,
+    )
+    model = build_correction_model(cfg, grid=grid)
+    model.eval()
+
+    assert isinstance(model.unet, InputChannelSelector)
+    assert model.unet.drop_first_channels == 3
+    assert isinstance(model.unet.model, InputChannelAppender)
+    assert model.unet.model.model.inc.double_conv[0].in_channels == 4
+
+    x = torch.randn(2, 2, 5, 32, 32)
+    x_changed = x.clone()
+    x_changed[:, :, :3] += 100.0
+
+    out = model(x)
+    out_changed = model(x_changed)
+
+    torch.testing.assert_close(
+        out - x[:, :, :3],
+        out_changed - x_changed[:, :, :3],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    out.square().mean().backward()
+    assert any(
+        param.grad is not None
+        for name, param in model.named_parameters()
+        if "encoder.siren" in name
+    )
 
 
 def test_ropeunet_forward_backward_smoke():

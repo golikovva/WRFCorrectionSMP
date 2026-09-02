@@ -310,6 +310,7 @@ if TRITON_AVAILABLE:
         stride_wa: tl.constexpr,
         stride_wi: tl.constexpr,
         stride_wd: tl.constexpr,
+        BATCH: tl.constexpr,
         N_POINTS: tl.constexpr,
         IN_M: tl.constexpr,
         OUT_M: tl.constexpr,
@@ -324,13 +325,26 @@ if TRITON_AVAILABLE:
         BLOCK_O: tl.constexpr,
         BLOCK_E: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        GROUP_POINTS: tl.constexpr,
     ):
         out_blocks = tl.cdiv(OUT_M, BLOCK_O)
         pid = tl.program_id(0)
-        out_block = pid % out_blocks
-        pid //= out_blocks
-        center = pid % N_POINTS
-        batch = pid // N_POINTS
+        if GROUP_POINTS == 1:
+            out_block = pid % out_blocks
+            pid //= out_blocks
+            center = pid % N_POINTS
+            batch = pid // N_POINTS
+        else:
+            tiles_per_batch: tl.constexpr = N_POINTS * out_blocks
+            batch = pid // tiles_per_batch
+            pid_in_batch = pid - batch * tiles_per_batch
+            group_width: tl.constexpr = GROUP_POINTS * out_blocks
+            group_id = pid_in_batch // group_width
+            first_center = group_id * GROUP_POINTS
+            group_points = tl.minimum(N_POINTS - first_center, GROUP_POINTS)
+            pid_in_group = pid_in_batch - group_id * group_width
+            out_block = pid_in_group // group_points
+            center = first_center + pid_in_group - out_block * group_points
 
         pair_count: tl.constexpr = BLOCK_O * BLOCK_ORDERS
         row_count: tl.constexpr = pair_count * 2
@@ -357,6 +371,7 @@ if TRITON_AVAILABLE:
             edge = edge_base + edge_offsets
             edge_mask = edge < edge_stop
             neighbor = tl.load(neighbor_idx + edge, mask=edge_mask, other=0)
+            radial_value = tl.load(radial_basis + edge, mask=edge_mask, other=0.0)
             raw = tl.zeros((BLOCK_E, row_count), tl.float32)
             k_base = 0
             while k_base < k_total:
@@ -380,7 +395,6 @@ if TRITON_AVAILABLE:
                     k_mask,
                     edge_mask,
                 )
-                radial_value = tl.load(radial_basis + edge, mask=edge_mask, other=0.0)
                 z = rotated_input * radial_value[None, :]
                 in_channel = packed_component // IN_DIM
                 in_component = packed_component - in_channel * IN_DIM
@@ -627,6 +641,7 @@ if TRITON_AVAILABLE:
         stride_wa: tl.constexpr,
         stride_wi: tl.constexpr,
         stride_wd: tl.constexpr,
+        BATCH: tl.constexpr,
         N_POINTS: tl.constexpr,
         IN_M: tl.constexpr,
         OUT_M: tl.constexpr,
@@ -641,13 +656,26 @@ if TRITON_AVAILABLE:
         BLOCK_I: tl.constexpr,
         BLOCK_E: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        GROUP_POINTS: tl.constexpr,
     ):
         in_blocks = tl.cdiv(IN_M, BLOCK_I)
         pid = tl.program_id(0)
-        in_block = pid % in_blocks
-        pid //= in_blocks
-        point = pid % N_POINTS
-        batch = pid // N_POINTS
+        if GROUP_POINTS == 1:
+            in_block = pid % in_blocks
+            pid //= in_blocks
+            point = pid % N_POINTS
+            batch = pid // N_POINTS
+        else:
+            tiles_per_batch: tl.constexpr = N_POINTS * in_blocks
+            batch = pid // tiles_per_batch
+            pid_in_batch = pid - batch * tiles_per_batch
+            group_width: tl.constexpr = GROUP_POINTS * in_blocks
+            group_id = pid_in_batch // group_width
+            first_point = group_id * GROUP_POINTS
+            group_points = tl.minimum(N_POINTS - first_point, GROUP_POINTS)
+            pid_in_group = pid_in_batch - group_id * group_width
+            in_block = pid_in_group // group_points
+            point = first_point + pid_in_group - in_block * group_points
 
         pair_count: tl.constexpr = BLOCK_I * BLOCK_ORDERS
         row_count: tl.constexpr = pair_count * 2
@@ -1147,7 +1175,16 @@ if TRITON_AVAILABLE:
         "OUT_DIM",
         "NUM_RADIAL",
     ]
-    _R1_AUTOTUNE_KEY = ["IN_M", "OUT_M", "IN_DIM", "OUT_DIM", "DEGREE_BUCKET"]
+    _R1_AUTOTUNE_KEY = [
+        "BATCH",
+        "N_POINTS",
+        "IN_M",
+        "OUT_M",
+        "IN_DIM",
+        "OUT_DIM",
+        "DEGREE_BUCKET",
+        "ALLOW_TF32",
+    ]
     _R1_GRAD_WEIGHT_AUTOTUNE_KEY = [
         "BATCH",
         "N_EDGES",
@@ -1159,23 +1196,40 @@ if TRITON_AVAILABLE:
         "DEGREE_BUCKET",
     ]
 
-    def _r1_configs(tile_name: str, tiles: tuple[int, ...], *, sm80: bool) -> list:
+    def _r1_configs(tile_name: str, tiles: tuple[int, ...], *, architecture: int) -> list:
         configs = []
-        edge_tiles = (16, 32) if sm80 else (16,)
-        for tile in tiles:
-            for block_e in edge_tiles:
-                configs.append(
-                    triton.Config(
-                        {tile_name: tile, "BLOCK_E": block_e, "BLOCK_K": 32},
-                        num_warps=4,
-                    )
-                )
-            configs.append(
-                triton.Config(
-                    {tile_name: tile, "BLOCK_E": edge_tiles[-1], "BLOCK_K": 64},
-                    num_warps=4,
-                )
+        if architecture >= 9:
+            shapes = (
+                (32, 32, 4, 3),
+                (64, 32, 4, 4),
+                (32, 64, 4, 4),
+                (64, 64, 8, 3),
+                (32, 64, 8, 5),
             )
+        elif architecture >= 8:
+            shapes = (
+                (16, 32, 4, 3),
+                (16, 32, 4, 2),
+                (32, 32, 4, 3),
+                (32, 64, 4, 3),
+            )
+        else:
+            shapes = ((16, 32, 4, 2),)
+        for tile in tiles:
+            for group_points in ((1, 8) if architecture >= 8 else (1,)):
+                for block_e, block_k, warps, stages in shapes:
+                    configs.append(
+                        triton.Config(
+                            {
+                                tile_name: tile,
+                                "BLOCK_E": block_e,
+                                "BLOCK_K": block_k,
+                                "GROUP_POINTS": group_points,
+                            },
+                            num_warps=warps,
+                            num_stages=stages,
+                        )
+                    )
         return configs
 
     _R1_TILE_FAMILIES = {
@@ -1186,18 +1240,18 @@ if TRITON_AVAILABLE:
     }
     _packed_forward_r1_kernels = {
         (architecture, family): triton.autotune(
-            configs=_r1_configs("BLOCK_O", tiles, sm80=architecture == 8),
+            configs=_r1_configs("BLOCK_O", tiles, architecture=architecture),
             key=_R1_AUTOTUNE_KEY,
         )(_packed_forward_r1_kernel)
-        for architecture in (7, 8)
+        for architecture in (7, 8, 9)
         for family, tiles in _R1_TILE_FAMILIES.items()
     }
     _packed_grad_input_r1_kernels = {
         (architecture, family): triton.autotune(
-            configs=_r1_configs("BLOCK_I", tiles, sm80=architecture == 8),
+            configs=_r1_configs("BLOCK_I", tiles, architecture=architecture),
             key=_R1_AUTOTUNE_KEY,
         )(_packed_grad_input_r1_kernel)
-        for architecture in (7, 8)
+        for architecture in (7, 8, 9)
         for family, tiles in _R1_TILE_FAMILIES.items()
     }
     _packed_grad_weight_r1_partial_sm70 = triton.autotune(
@@ -1212,6 +1266,31 @@ if TRITON_AVAILABLE:
             triton.Config({"BLOCK_O": 16, "BLOCK_I": 16, "BLOCK_S": 16}, num_warps=4),
             triton.Config({"BLOCK_O": 16, "BLOCK_I": 16, "BLOCK_S": 32}, num_warps=4),
             triton.Config({"BLOCK_O": 16, "BLOCK_I": 16, "BLOCK_S": 64}, num_warps=4),
+        ],
+        key=_R1_GRAD_WEIGHT_AUTOTUNE_KEY,
+    )(_packed_grad_weight_r1_partial_kernel)
+    _packed_grad_weight_r1_partial_sm90 = triton.autotune(
+        configs=[
+            triton.Config(
+                {"BLOCK_O": 16, "BLOCK_I": 16, "BLOCK_S": 32},
+                num_warps=4,
+                num_stages=3,
+            ),
+            triton.Config(
+                {"BLOCK_O": 16, "BLOCK_I": 32, "BLOCK_S": 64},
+                num_warps=4,
+                num_stages=4,
+            ),
+            triton.Config(
+                {"BLOCK_O": 32, "BLOCK_I": 32, "BLOCK_S": 64},
+                num_warps=8,
+                num_stages=4,
+            ),
+            triton.Config(
+                {"BLOCK_O": 32, "BLOCK_I": 64, "BLOCK_S": 64},
+                num_warps=8,
+                num_stages=5,
+            ),
         ],
         key=_R1_GRAD_WEIGHT_AUTOTUNE_KEY,
     )(_packed_grad_weight_r1_partial_kernel)
@@ -1303,7 +1382,7 @@ if TRITON_AVAILABLE:
         major = torch.cuda.get_device_capability(x.device)[0]
         if radial == 1:
             block_orders = triton.next_power_of_2(max_out_order + 1)
-            architecture = 7 if major < 8 else 8
+            architecture = 7 if major < 8 else 8 if major < 9 else 9
             kernel = _packed_forward_r1_kernels[(architecture, _r1_tile_family(out_dim))]
             grid = lambda meta: (
                 batch * n_points * triton.cdiv(out_m, meta["BLOCK_O"]),
@@ -1312,7 +1391,8 @@ if TRITON_AVAILABLE:
                 x, weight, neighbor_idx, center_ptr, radial_basis, input_cos, input_sin,
                 output_cos, output_sin, input_pack, output_pack, neighbor_count, out,
                 x.stride(0), x.stride(1), x.stride(2), *weight.stride(),
-                N_POINTS=n_points, IN_M=in_m, OUT_M=out_m, IN_DIM=in_dim, OUT_DIM=out_dim,
+                BATCH=batch, N_POINTS=n_points, IN_M=in_m, OUT_M=out_m,
+                IN_DIM=in_dim, OUT_DIM=out_dim,
                 MAX_IN_ORDER=max_in_order, MAX_OUT_ORDER=max_out_order,
                 BLOCK_ORDERS=block_orders, DEGREE_BUCKET=degree_bucket,
                 NORMALIZE=normalize, ALLOW_TF32=allow_tf32,
@@ -1368,7 +1448,7 @@ if TRITON_AVAILABLE:
         grad_weight = torch.empty_like(weight, memory_format=torch.contiguous_format)
         if radial == 1:
             block_orders = triton.next_power_of_2(max_in_order + 1)
-            architecture = 7 if major < 8 else 8
+            architecture = 7 if major < 8 else 8 if major < 9 else 9
             kernel = _packed_grad_input_r1_kernels[(architecture, _r1_tile_family(in_dim))]
             grid_x = lambda meta: (
                 batch * n_points * triton.cdiv(in_m, meta["BLOCK_I"]),
@@ -1377,7 +1457,7 @@ if TRITON_AVAILABLE:
                 grad_out, weight, center_idx, neighbor_ptr, edges_by_neighbor, radial_basis,
                 input_cos, input_sin, output_cos, output_sin, input_pack, output_pack,
                 neighbor_count, grad_x, *weight.stride(), N_POINTS=n_points, IN_M=in_m,
-                OUT_M=out_m, IN_DIM=in_dim, OUT_DIM=out_dim,
+                BATCH=batch, OUT_M=out_m, IN_DIM=in_dim, OUT_DIM=out_dim,
                 MAX_IN_ORDER=max_in_order, MAX_OUT_ORDER=max_out_order,
                 BLOCK_ORDERS=block_orders, DEGREE_BUCKET=degree_bucket,
                 NORMALIZE=normalize, ALLOW_TF32=allow_tf32,
@@ -1411,6 +1491,8 @@ if TRITON_AVAILABLE:
                 _packed_grad_weight_r1_partial_sm70
                 if major < 8
                 else _packed_grad_weight_r1_partial_sm80
+                if major < 9
+                else _packed_grad_weight_r1_partial_sm90
             )
             wrap_triton(partial_kernel)[grid_w](
                 x, grad_out, center_idx, neighbor_idx, radial_basis, input_cos, input_sin,
