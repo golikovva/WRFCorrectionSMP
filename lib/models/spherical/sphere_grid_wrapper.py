@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral
 from os import PathLike
 from pathlib import Path
@@ -14,7 +14,13 @@ import torch
 from torch import Tensor, nn
 
 from ...data.spherical.sphere_geometry import TangentFrameStrategy, latlon_to_xyz
-from ...data.spherical.sphere_hierarchy import SphereGraphHierarchy, build_fps_sphere_hierarchy
+from ...data.spherical.sphere_hierarchy import (
+    HierarchyBuildSpec,
+    SphereGraphHierarchy,
+    build_equidistant_sphere_hierarchy,
+    build_fps_sphere_hierarchy,
+    normalize_pool_kernel_size,
+)
 from .irrep_layers import IrrepSphereConv, SO2IrrepFieldType
 
 OutputLayout = Literal["auto", "grid", "flat"]
@@ -179,13 +185,30 @@ class SphereGridModelWrapper(nn.Module):
         model = SphereGridModelWrapper(unet, grid)
         output = model(data)  # [B, C, H, W] -> [B, C, H, W]
 
+        # Block averaging, including partial windows at the grid boundary:
+        model = SphereGridModelWrapper(
+            unet, grid, mode="equidistant", pool_kernel_size=2,
+        )
+
     ``grid`` must contain ``"latitude"`` and ``"longitude"`` values.  They may
     be matching two-dimensional arrays or a pair of one-dimensional coordinate
     arrays.  ``frame_strategy="east_north"`` interprets vector components in
     the conventional east/north basis; no channel conversion is performed.
+    ``mode="fps"`` preserves farthest-point sampling.  ``mode="equidistant"``
+    groups the rectangular grid into non-overlapping windows, equivalent for
+    scalar features to ``AvgPool2d(pool_kernel_size, ceil_mode=True, padding=0)``.
+    An integer window applies to both axes; a pair gives its
+    height and width.  Coordinates and vector transport remain spherical.
+    Coarse points are the normalized means of actual block members, so the
+    last interval can be shorter at a partial boundary.  Each level's radius
+    grows by the geometric mean of the window dimensions, capped at pi times
+    the Earth radius.  ``pool_ratio`` and ``min_points`` apply only to FPS.
+
     Pass ``from_file`` to reuse a hierarchy saved by an earlier run, or
     ``to_file`` to persist the resulting hierarchy for future runs.  Cached
-    hierarchies are accepted only when their finest level matches ``grid``.
+    hierarchies must match ``grid`` and their recorded build options.  Legacy
+    caches without build metadata are accepted only in FPS mode, using the
+    original finest-level coordinate check.
     """
 
     def __init__(
@@ -201,6 +224,8 @@ class SphereGridModelWrapper(nn.Module):
         prefer_scipy: bool = True,
         pool_ratio: float = 0.25,
         min_points: int = 16,
+        mode: Literal["fps", "equidistant"] = "fps",
+        pool_kernel_size: int | tuple[int, int] = 2,
         output_layout: OutputLayout = "auto",
         frame_strategy: TangentFrameStrategy = "robust",
         input_schema: FieldSchema | None = None,
@@ -220,6 +245,13 @@ class SphereGridModelWrapper(nn.Module):
             raise KeyError(f"grid is missing required coordinate(s): {names}")
         if output_layout not in ("auto", "grid", "flat"):
             raise ValueError("output_layout must be 'auto', 'grid', or 'flat'")
+        if mode not in ("fps", "equidistant"):
+            raise ValueError("mode must be 'fps' or 'equidistant'")
+        kernel_size = normalize_pool_kernel_size(pool_kernel_size) if mode == "equidistant" else None
+        if mode == "equidistant" and (
+            isinstance(levels, bool) or not isinstance(levels, Integral) or levels < 1
+        ):
+            raise ValueError("levels must be a positive integer")
         self._validate_model_schema(model, input_schema, "in_type", "input_schema")
         self._validate_model_schema(model, output_schema, "output_type", "output_schema")
         if irrep_conv_backend is not None:
@@ -247,8 +279,10 @@ class SphereGridModelWrapper(nn.Module):
             "earth_radius_km": float(earth_radius_km),
             "degrees": bool(degrees),
             "prefer_scipy": bool(prefer_scipy),
-            "pool_ratio": float(pool_ratio),
-            "min_points": int(min_points),
+            "pool_ratio": float(pool_ratio) if mode == "fps" else None,
+            "min_points": int(min_points) if mode == "fps" else None,
+            "mode": mode,
+            "pool_kernel_size": kernel_size,
             "frame_strategy": frame_strategy,
         }
         target_device, target_dtype = self._model_device_dtype()
@@ -314,18 +348,36 @@ class SphereGridModelWrapper(nn.Module):
             degrees=options["degrees"],
             dtype=torch.float32,
         )
-        if from_file is None:
-            hierarchy = build_fps_sphere_hierarchy(
-                points_xyz,
-                levels=options["levels"],
-                radius_km=options["radius_km"],
-                max_neighbors=options["max_neighbors"],
-                earth_radius_km=options["earth_radius_km"],
-                prefer_scipy=options["prefer_scipy"],
-                pool_ratio=options["pool_ratio"],
-                min_points=options["min_points"],
-                frame_strategy=options["frame_strategy"],
+        graph_options = {
+            name: options[name]
+            for name in (
+                "levels", "radius_km", "max_neighbors", "earth_radius_km",
+                "prefer_scipy", "frame_strategy",
             )
+        }
+        build_spec = HierarchyBuildSpec(
+            mode=options["mode"],
+            grid_shape=grid_shape,
+            pool_kernel_size=options["pool_kernel_size"],
+            pool_ratio=options["pool_ratio"],
+            min_points=options["min_points"],
+            **graph_options,
+        )
+        if from_file is None:
+            if options["mode"] == "equidistant":
+                hierarchy = build_equidistant_sphere_hierarchy(
+                    points_xyz.reshape(*grid_shape, 3),
+                    pool_kernel_size=options["pool_kernel_size"],
+                    **graph_options,
+                )
+            else:
+                hierarchy = build_fps_sphere_hierarchy(
+                    points_xyz,
+                    pool_ratio=options["pool_ratio"],
+                    min_points=options["min_points"],
+                    **graph_options,
+                )
+            hierarchy = replace(hierarchy, build_spec=build_spec)
         else:
             load_kwargs = {"map_location": "cpu"}
             try:
@@ -344,6 +396,19 @@ class SphereGridModelWrapper(nn.Module):
                 expected_points.to(dtype=cached_points.dtype),
             ):
                 raise ValueError("the hierarchy in from_file does not match the supplied grid")
+            cached_spec = getattr(hierarchy, "build_spec", None)
+            if cached_spec is None:
+                if options["mode"] == "equidistant":
+                    raise ValueError(
+                        "the hierarchy in from_file has no build metadata; "
+                        "rebuild it for mode='equidistant'"
+                    )
+            elif cached_spec != build_spec:
+                raise ValueError(
+                    "the hierarchy in from_file has incompatible build metadata "
+                    "(mode, grid shape, pooling window, levels, or geometry options); "
+                    "rebuild it for the requested configuration"
+                )
 
         if to_file is not None:
             destination = Path(to_file)

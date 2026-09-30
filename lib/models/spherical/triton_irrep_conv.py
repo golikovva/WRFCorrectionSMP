@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from ._triton_layout import fix_triton_strides
+
 try:
     import triton
     import triton.language as tl
@@ -25,7 +27,12 @@ AUTO_WORK_THRESHOLD = 1 << 20
 AUTO_INFERENCE_WORK_THRESHOLDS = {7: AUTO_WORK_THRESHOLD, 8: 1 << 24}
 AUTO_TRAINING_WORK_THRESHOLDS = {7: 1 << 29, 8: 1 << 30}
 MAX_ORDER = 8
+# Keep this shared limit unchanged for irregular and multi-radial kernels.  The
+# tiled R1 kernels have a separately bounded extension for the large decoder
+# signatures used by the production model.
 MAX_MULTIPLICITY = 512
+MAX_R1_MULTIPLICITY = 1056
+MAX_R1_PACKED_WIDTH = MAX_MULTIPLICITY * (2 * MAX_ORDER + 1)
 MAX_RADIAL = 4
 R1_GRAD_WEIGHT_WORKSPACE_BYTES = 64 << 20
 
@@ -50,10 +57,21 @@ def triton_support_reason(x: Tensor, weight: Tensor, max_in_order: int, max_out_
         return "bfloat16 Triton path requires compute capability 8.0 or newer"
     if int(max_in_order) > MAX_ORDER or int(max_out_order) > MAX_ORDER:
         return f"maximum supported irrep order is {MAX_ORDER}"
-    radial, out_m, _out_dim, in_m, _in_dim = map(int, weight.shape)
+    radial, out_m, out_dim, in_m, in_dim = map(int, weight.shape)
     if radial > MAX_RADIAL:
         return f"maximum supported radial count is {MAX_RADIAL}"
-    if in_m > MAX_MULTIPLICITY or out_m > MAX_MULTIPLICITY:
+    if radial == 1:
+        if in_m > MAX_R1_MULTIPLICITY or out_m > MAX_R1_MULTIPLICITY:
+            return f"maximum supported R1 multiplicity is {MAX_R1_MULTIPLICITY}"
+        if (
+            in_m * in_dim > MAX_R1_PACKED_WIDTH
+            or out_m * out_dim > MAX_R1_PACKED_WIDTH
+        ):
+            return (
+                "maximum supported R1 packed component width is "
+                f"{MAX_R1_PACKED_WIDTH}"
+            )
+    elif in_m > MAX_MULTIPLICITY or out_m > MAX_MULTIPLICITY:
         return f"maximum supported multiplicity is {MAX_MULTIPLICITY}"
     return None
 
@@ -78,6 +96,24 @@ def _r1_grad_weight_partial_count(
     )
     sample_blocks = max(1, (batch * n_edges + 31) // 32)
     return min(desired_partials, max_workspace_partials, sample_blocks)
+
+
+def _r1_grad_weight_grid(
+    *,
+    partials: int,
+    out_m: int,
+    in_m: int,
+    out_dim: int,
+    in_dim: int,
+):
+    """Build a config-aware launch grid for the tiled R1 weight gradient."""
+
+    def grid(meta) -> tuple[int]:
+        out_blocks = (int(out_m) + int(meta["BLOCK_O"]) - 1) // int(meta["BLOCK_O"])
+        in_blocks = (int(in_m) + int(meta["BLOCK_I"]) - 1) // int(meta["BLOCK_I"])
+        return (int(partials) * int(out_dim) * int(in_dim) * out_blocks * in_blocks,)
+
+    return grid
 
 
 if TRITON_AVAILABLE:
@@ -942,6 +978,29 @@ if TRITON_AVAILABLE:
         tl.store(grad_weight + offset, acc, mask=out_mask[:, None] & in_mask[None, :])
 
 
+    # Inductor serializes global constexprs and JIT helpers, but omits
+    # project-local builtin extern wrappers from its generated source.
+    _R1_DW_RN_TYPES = tl.constexpr({
+        (tl.float32, tl.float32): ("llvm.nvvm.add.rn.f", tl.float32),
+    })
+
+    @triton.jit
+    def _r1_dw_add_rn(a, b):
+        # Triton 3.2's builtin expects unwrapped Python dispatch metadata.
+        # Direct NVVM RN avoids libdevice's FTZ reflection for subnormals.
+        return tl.core.extern_elementwise(
+            "libdevice".value, "".value, [a, b], _R1_DW_RN_TYPES.value,
+            is_pure=True.value,
+        )
+
+    @triton.jit
+    def _r1_dw_sub_rn(a, b):
+        # Exact sign-bit negation preserves signed zero; Triton unary minus
+        # can lower as 0-b before LLVM's fneg representation is formed.
+        negative = (b.to(tl.uint32, bitcast=True) ^ 0x80000000).to(tl.float32, bitcast=True)
+        return _r1_dw_add_rn(a, negative)
+
+
     @triton.jit
     def _packed_grad_weight_r1_partial_kernel(
         x,
@@ -993,6 +1052,8 @@ if TRITON_AVAILABLE:
         in_mask = in_channels < IN_M
         out_mask = out_channels < OUT_M
         acc = tl.zeros((BLOCK_O, BLOCK_I), tl.float32)
+        compensation = tl.zeros((BLOCK_O, BLOCK_I), tl.float32)
+        compensation_error = tl.zeros((BLOCK_O, BLOCK_I), tl.float32)
         sample_total: tl.constexpr = BATCH * N_EDGES
         chunk_size: tl.constexpr = tl.cdiv(sample_total, PARTIALS)
         sample_base = partial * chunk_size
@@ -1120,11 +1181,21 @@ if TRITON_AVAILABLE:
             beta = tl.load(radial_basis + edge, mask=sample_mask, other=0.0)
             left = (g_value * beta[:, None]).to(x_value.dtype)
             if ALLOW_TF32:
-                acc += tl.dot(tl.trans(left), x_value, input_precision="tf32")
+                block_sum = tl.dot(tl.trans(left), x_value, input_precision="tf32")
             else:
-                acc += tl.dot(tl.trans(left), x_value, input_precision="ieee")
+                block_sum = tl.dot(tl.trans(left), x_value, input_precision="ieee")
+            total = _r1_dw_add_rn(acc, block_sum)
+            acc_residual = _r1_dw_add_rn(_r1_dw_sub_rn(acc, total), block_sum)
+            block_residual = _r1_dw_add_rn(_r1_dw_sub_rn(block_sum, total), acc)
+            residual = tl.where(tl.abs(acc) >= tl.abs(block_sum), acc_residual, block_residual)
+            corrected_residual = _r1_dw_sub_rn(residual, compensation_error)
+            next_compensation = _r1_dw_add_rn(compensation, corrected_residual)
+            compensation_error = _r1_dw_sub_rn(_r1_dw_sub_rn(next_compensation, compensation), corrected_residual)
+            compensation = next_compensation
+            acc = total
             sample_base += BLOCK_S
 
+        acc = _r1_dw_sub_rn(_r1_dw_add_rn(acc, compensation), compensation_error)
         weight_numel: tl.constexpr = OUT_M * OUT_DIM * IN_M * IN_DIM
         offset = (
             ((out_channels[:, None] * OUT_DIM + out_component) * IN_M + in_channels[None, :])
@@ -1164,16 +1235,23 @@ if TRITON_AVAILABLE:
         tl.store(grad_weight + weight_offset, acc, mask=weight_mask)
 
 
-    _FORWARD_AUTOTUNE_KEY = ["IN_M", "OUT_M", "IN_DIM", "OUT_DIM", "NUM_RADIAL"]
-    _BACKWARD_AUTOTUNE_KEY = ["IN_M", "OUT_M", "IN_DIM", "OUT_DIM", "NUM_RADIAL"]
+    _FORWARD_AUTOTUNE_KEY = [
+        "IN_M", "OUT_M", "IN_DIM", "OUT_DIM", "NUM_RADIAL", "NORMALIZE", "ALLOW_TF32",
+    ]
+    _BACKWARD_AUTOTUNE_KEY = [
+        "IN_M", "OUT_M", "IN_DIM", "OUT_DIM", "NUM_RADIAL", "NORMALIZE", "ALLOW_TF32",
+    ]
     _GRAD_WEIGHT_AUTOTUNE_KEY = [
         "BATCH",
+        "N_POINTS",
         "N_EDGES",
         "IN_M",
         "OUT_M",
         "IN_DIM",
         "OUT_DIM",
         "NUM_RADIAL",
+        "NORMALIZE",
+        "ALLOW_TF32",
     ]
     _R1_AUTOTUNE_KEY = [
         "BATCH",
@@ -1183,10 +1261,12 @@ if TRITON_AVAILABLE:
         "IN_DIM",
         "OUT_DIM",
         "DEGREE_BUCKET",
+        "NORMALIZE",
         "ALLOW_TF32",
     ]
     _R1_GRAD_WEIGHT_AUTOTUNE_KEY = [
         "BATCH",
+        "N_POINTS",
         "N_EDGES",
         "IN_M",
         "OUT_M",
@@ -1194,12 +1274,15 @@ if TRITON_AVAILABLE:
         "OUT_DIM",
         "PARTIALS",
         "DEGREE_BUCKET",
+        "NORMALIZE",
+        "ALLOW_TF32",
     ]
 
     def _r1_configs(tile_name: str, tiles: tuple[int, ...], *, architecture: int) -> list:
         configs = []
         if architecture >= 9:
             shapes = (
+                (32, 32, 4, 2),
                 (32, 32, 4, 3),
                 (64, 32, 4, 4),
                 (32, 64, 4, 4),
@@ -1375,6 +1458,8 @@ if TRITON_AVAILABLE:
         normalize: bool,
         allow_tf32: bool,
     ) -> Tensor:
+        x = fix_triton_strides(x)
+        weight = fix_triton_strides(weight)
         radial, out_m, out_dim, in_m, in_dim, batch, n_points = _launch_meta(x, weight)
         out = torch.empty((batch, n_points, out_m * out_dim), device=x.device, dtype=x.dtype)
         max_in_order = (in_dim - 1) // 2
@@ -1433,6 +1518,9 @@ if TRITON_AVAILABLE:
         normalize: bool,
         allow_tf32: bool,
     ) -> tuple[Tensor, Tensor]:
+        grad_out = fix_triton_strides(grad_out)
+        x = fix_triton_strides(x)
+        weight = fix_triton_strides(weight)
         del center_ptr
         radial, out_m, out_dim, in_m, in_dim, batch, n_points = _launch_meta(x, weight)
         max_in_order = (in_dim - 1) // 2
@@ -1475,7 +1563,6 @@ if TRITON_AVAILABLE:
         n_edges = int(neighbor_idx.numel())
         if radial == 1:
             weight_numel = int(weight.numel())
-            weight_tiles = out_dim * in_dim * triton.cdiv(out_m, 16) * triton.cdiv(in_m, 16)
             partials = _r1_grad_weight_partial_count(weight, batch=batch, n_edges=n_edges)
             partial_weight = (
                 grad_weight
@@ -1486,7 +1573,13 @@ if TRITON_AVAILABLE:
                     dtype=torch.float32,
                 )
             )
-            grid_w = (partials * weight_tiles,)
+            grid_w = _r1_grad_weight_grid(
+                partials=partials,
+                out_m=out_m,
+                in_m=in_m,
+                out_dim=out_dim,
+                in_dim=in_dim,
+            )
             partial_kernel = (
                 _packed_grad_weight_r1_partial_sm70
                 if major < 8
@@ -1568,6 +1661,8 @@ __all__ = [
     "MAX_MULTIPLICITY",
     "MAX_ORDER",
     "MAX_RADIAL",
+    "MAX_R1_MULTIPLICITY",
+    "MAX_R1_PACKED_WIDTH",
     "R1_GRAD_WEIGHT_WORKSPACE_BYTES",
     "TRITON_AVAILABLE",
     "packed_irrep_conv",

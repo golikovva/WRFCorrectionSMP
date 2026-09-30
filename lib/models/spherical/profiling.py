@@ -440,6 +440,20 @@ class ConvolutionComparison:
                     paths["triton_semi_packed"] = lambda x: regular_triton(
                         x, variant="semi_packed",
                     )
+                if not include_backward:
+                    previous_variant = module.regular_r1_variant
+                    module.regular_r1_variant = "exact_edge"
+                    try:
+                        with torch.inference_mode():
+                            exact_reason = module._triton_unsupported_reason(
+                                x_base, geometry,
+                            )
+                    finally:
+                        module.regular_r1_variant = previous_variant
+                    if exact_reason is None:
+                        paths["triton_exact_edge"] = lambda x: regular_triton(
+                            x, variant="exact_edge",
+                        )
             paths["triton"] = lambda x: module._forward_spatial_triton(x, geometry)
         reference_name = "packed" if "packed" in paths else "blockwise"
         reference = paths[reference_name](x_base).detach()
@@ -476,7 +490,9 @@ class ConvolutionComparison:
             *,
             training: bool = False,
         ) -> str | None:
-            if path_name in ("triton_fused", "triton_semi_packed"):
+            if path_name in (
+                "triton_fused", "triton_semi_packed", "triton_exact_edge",
+            ):
                 return path_name.removeprefix("triton_")
             if (
                 path_name == "triton"
@@ -619,7 +635,9 @@ class ConvolutionComparison:
                     row["speedup_vs_reference"] = reference_ms / row["median_ms"]
         return rows
 
-    def export_nsight_cases(self) -> list[Path]:
+    def export_nsight_cases(
+        self, *, include_exact_edge: bool = True,
+    ) -> list[Path]:
         """Serialize isolated production and forced Triton workloads."""
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -631,7 +649,17 @@ class ConvolutionComparison:
             variants = ["configured"]
             if case.module._regular_weights and case.module.num_radial == 1:
                 variants.extend(("fused", "semi_packed"))
+                if include_exact_edge:
+                    variants.append("exact_edge")
             for variant in variants:
+                if variant == "exact_edge":
+                    exact_probe = torch.empty(
+                        case.shape, device="meta", dtype=case.dtype,
+                    )
+                    if case.module._exact_edge_workspace_plan(
+                        exact_probe, case.geometry,
+                    ) is None:
+                        continue
                 payload_path = self.output_dir / (
                     f"case_{index:02d}_{_slug(case.name)}_{variant}.pt"
                 )
@@ -681,7 +709,9 @@ class ConvolutionComparison:
     ) -> pd.DataFrame:
         """Run Nsight Compute for each captured Triton case in isolated processes."""
 
-        payloads = self.export_nsight_cases()
+        payloads = self.export_nsight_cases(
+            include_exact_edge=mode == "forward",
+        )
         ncu = shutil.which("ncu")
         project_root = Path(__file__).resolve().parents[3]
         child_env = os.environ.copy()
@@ -698,8 +728,9 @@ class ConvolutionComparison:
         kernel_filters = {
             "forward": (
                 "regex:(_packed_forward_r1_kernel|_transpose_weight_r1_kernel|"
-                "_gather_input_r1_kernel|"
-                "_semi_matmul_r1_kernel|_reduce_output_r1_kernel)"
+                "_gather_input_r1_kernel|_gather_exact_edge_r1_kernel|"
+                "_semi_matmul_r1_kernel|_wide_transposed_matmul_r1_kernel|"
+                "_reduce_output_r1_kernel|_reduce_exact_edge_r1_kernel)"
             ),
             "grad_input": (
                 "regex:(_packed_grad_input_r1_kernel|_reduce_grad_input_r1_kernel)"
@@ -1143,7 +1174,13 @@ def _geometry_to(
 ) -> _IrrepConvGeometry:
     values: dict[str, Any] = {}
     for item in fields(geometry):
-        value = getattr(geometry, item.name)
+        if item.name == "center_ptr_host" and not hasattr(geometry, item.name):
+            value = tuple(
+                int(entry)
+                for entry in geometry.center_ptr.detach().to("cpu").tolist()
+            )
+        else:
+            value = getattr(geometry, item.name)
         if isinstance(value, Tensor):
             values[item.name] = value.to(
                 device=device,

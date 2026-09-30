@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+from numbers import Integral
 from collections.abc import Sequence
 from typing import Literal
 import torch
@@ -25,12 +26,25 @@ from .triton_semi_packed_irrep_conv import (
     semi_packed_support_reason,
     should_use_semi_packed,
 )
+from .triton_exact_edge_irrep_conv import (
+    EXACT_EDGE_AVAILABLE,
+    PRODUCTION_EXACT_EDGE_MATMUL_FAMILY,
+    PRODUCTION_EXACT_EDGE_WEIGHT_LAYOUT,
+    ExactEdgeWorkspacePlan,
+    exact_edge_irrep_conv,
+    exact_edge_workspace_plan,
+    plan_argument_lists as exact_edge_plan_argument_lists,
+    should_use_exact_edge_plan,
+)
 from .triton_irregular_irrep_conv import (
     irregular_irrep_pair_conv,
     irregular_pair_support_reason,
 )
 from ...data.spherical.sphere_geometry import rotation_matrices_from_cos_sin
 from ...data.spherical.sphere_graph import SphereGraphGeometry
+
+
+MAX_TRITON_WORKSPACE_MIB = 512
 
 
 def _reset_weight(weight: Tensor) -> None:
@@ -511,8 +525,13 @@ class _IrrepConvGeometry:
     triton_center_idx: Tensor
     triton_neighbor_idx: Tensor
     center_ptr: Tensor
+    center_ptr_host: tuple[int, ...]
     neighbor_ptr: Tensor
     edges_by_neighbor: Tensor
+    # Exact CSR row maxima drive bounded workspace strides.  The rounded bucket
+    # remains separate so dispatch signatures keep their calibrated classes.
+    max_center_degree: int
+    max_neighbor_degree: int
     degree_bucket: int
     neighbor_count: Tensor
     transport_angle: Tensor
@@ -546,7 +565,9 @@ class IrrepSphereConv(_RadialBasisConvBase):
         quadrature_angular: int = 16,
         quadrature_sigma_km: float | None = None,
         backend: Literal["auto", "torch", "triton"] = "auto",
-        regular_r1_variant: Literal["auto", "fused", "semi_packed"] = "auto",
+        regular_r1_variant: Literal[
+            "auto", "fused", "semi_packed", "exact_edge"
+        ] = "auto",
         triton_workspace_mib: int = 512,
     ) -> None:
         super().__init__(
@@ -568,13 +589,16 @@ class IrrepSphereConv(_RadialBasisConvBase):
         if self.backend not in ("auto", "torch", "triton"):
             raise ValueError("backend must be 'auto', 'torch', or 'triton'")
         self.regular_r1_variant = str(regular_r1_variant)
-        if self.regular_r1_variant not in ("auto", "fused", "semi_packed"):
+        if self.regular_r1_variant not in (
+            "auto", "fused", "semi_packed", "exact_edge",
+        ):
             raise ValueError(
-                "regular_r1_variant must be 'auto', 'fused', or 'semi_packed'"
+                "regular_r1_variant must be 'auto', 'fused', 'semi_packed', "
+                "or 'exact_edge'"
             )
-        if isinstance(triton_workspace_mib, bool) or int(triton_workspace_mib) < 0:
-            raise ValueError("triton_workspace_mib must be a non-negative integer")
-        self.triton_workspace_mib = int(triton_workspace_mib)
+        self.triton_workspace_mib = self._validate_triton_workspace_mib(
+            triton_workspace_mib
+        )
         if self.quadrature_radial < 1:
             raise ValueError("quadrature_radial must be positive")
         if self.quadrature_angular < 1:
@@ -593,6 +617,13 @@ class IrrepSphereConv(_RadialBasisConvBase):
             self.register_buffer("quadrature_theta", unit_rule.theta)
             self.register_buffer("quadrature_weight", unit_rule.weight)
         self._prepared_geometry: _IrrepConvGeometry | None = None
+        self._prepared_exact_edge_plans: dict[
+            tuple[int, torch.dtype, int], ExactEdgeWorkspacePlan | None
+        ] = {}
+        self._prepared_exact_edge_arguments: dict[
+            tuple[int, torch.dtype, int],
+            tuple[list[int], list[int], list[int], list[int]],
+        ] = {}
         # Private benchmark/debug switch. It is deliberately not a parameter or
         # buffer, so checkpoints and the public constructor stay unchanged.
         self._irregular_r1_fast_path = True
@@ -642,6 +673,8 @@ class IrrepSphereConv(_RadialBasisConvBase):
             else None
         )
         self.reset_parameters()
+        if self.quadrature:
+            self.register_load_state_dict_post_hook(self._refresh_quadrature_after_load)
 
     def __setstate__(self, state: dict) -> None:
         """Load profiler payloads created before regular R1 controls existed."""
@@ -649,6 +682,42 @@ class IrrepSphereConv(_RadialBasisConvBase):
         super().__setstate__(state)
         self.__dict__.setdefault("regular_r1_variant", "auto")
         self.__dict__.setdefault("triton_workspace_mib", 512)
+        self.__dict__.setdefault("_prepared_exact_edge_plans", {})
+        self.__dict__.setdefault("_prepared_exact_edge_arguments", {})
+        geometry = self.__dict__.get("_prepared_geometry")
+        if geometry is not None and not hasattr(geometry, "center_ptr_host"):
+            # Prepared geometry is rebuildable cache state.  Old serialized
+            # modules cannot safely enter exact-edge forward without the host
+            # CSR copy, so require prepare_graph() rather than synchronizing in
+            # forward or guessing descriptors.
+            self._prepared_geometry = None
+            self._prepared_exact_edge_plans = {}
+            self._prepared_exact_edge_arguments = {}
+        self.triton_workspace_mib = self._validate_triton_workspace_mib(
+            self.triton_workspace_mib
+        )
+
+    @staticmethod
+    def _validate_triton_workspace_mib(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(
+                "triton_workspace_mib must be an integer between 0 and "
+                f"{MAX_TRITON_WORKSPACE_MIB} inclusive"
+            )
+        workspace_mib = int(value)
+        if workspace_mib < 0 or workspace_mib > MAX_TRITON_WORKSPACE_MIB:
+            raise ValueError(
+                "triton_workspace_mib must be an integer between 0 and "
+                f"{MAX_TRITON_WORKSPACE_MIB} inclusive"
+            )
+        return workspace_mib
+
+    def _triton_workspace_bytes(self) -> int:
+        """Return the revalidated public workspace limit in bytes."""
+
+        return self._validate_triton_workspace_mib(
+            self.triton_workspace_mib
+        ) << 20
 
     @staticmethod
     def _weight_key(out_order: int, in_order: int) -> str:
@@ -695,7 +764,31 @@ class IrrepSphereConv(_RadialBasisConvBase):
 
     def _apply(self, fn, recurse: bool = True):
         self.clear_prepared_graph()
-        return super()._apply(fn, recurse=recurse)
+        result = super()._apply(fn, recurse=recurse)
+        self._refresh_quadrature_buffers()
+        return result
+
+    def _refresh_quadrature_buffers(self) -> None:
+        """Recompute derived nodes instead of promoting previously rounded values."""
+        if not self.quadrature:
+            return
+        rule = quadrature_disk_rule(
+            self.quadrature_radial,
+            self.quadrature_angular,
+            radius_km=1.0,
+            device=self.quadrature_theta.device,
+            dtype=self.quadrature_theta.dtype,
+        )
+        self.quadrature_unit_points = rule.points
+        self.quadrature_unit_r = rule.r
+        self.quadrature_theta = rule.theta
+        self.quadrature_weight = rule.weight
+
+    def _refresh_quadrature_after_load(self, module, incompatible_keys) -> None:
+        # Older checkpoints stored these derived buffers in FP32.  Loading them
+        # into an FP64 module must restore the target-precision quadrature rule.
+        self.clear_prepared_graph()
+        self._refresh_quadrature_buffers()
 
     def _geometry_signature(self) -> tuple[object, ...]:
         """Configuration that must match before two layers share geometry."""
@@ -732,11 +825,14 @@ class IrrepSphereConv(_RadialBasisConvBase):
             in_orders=self._in_orders,
             out_orders=self._out_orders,
         )
+        self._prepare_exact_edge_plans()
 
     def clear_prepared_graph(self) -> None:
         """Drop the static graph binding without changing learned parameters."""
 
         self._prepared_geometry = None
+        self._prepared_exact_edge_plans = {}
+        self._prepared_exact_edge_arguments = {}
 
     def _bind_prepared_geometry(self, geometry: _IrrepConvGeometry) -> None:
         """Bind geometry built by a compatible layer (used by model geometry banks)."""
@@ -764,6 +860,88 @@ class IrrepSphereConv(_RadialBasisConvBase):
                 geometry.single_radial_input_sin, max_in_order,
             ),
         )
+        self._prepare_exact_edge_plans()
+
+    def _prepare_exact_edge_plans(self) -> None:
+        """Precompute the common static-batch descriptor plans off device."""
+
+        self._prepared_exact_edge_plans = {}
+        self._prepared_exact_edge_arguments = {}
+        geometry = self._prepared_geometry
+        if (
+            geometry is None
+            or self.quadrature
+            or not self._regular_weights
+            or self.num_radial != 1
+            or geometry.radial_basis is None
+        ):
+            return
+        workspace_bytes = self._triton_workspace_bytes()
+        dtype = geometry.radial_basis.dtype
+        # Production inference and the correctness suite use B=1 or B=2.  Both
+        # plans are immutable Python descriptors captured before compilation;
+        # unusual larger batches remain supported by a host-only fallback.
+        for batch in (1, 2):
+            shape = torch.empty(
+                (batch, geometry.n_points, self.in_type.total_dim),
+                device="meta",
+                dtype=dtype,
+            )
+            key = (batch, dtype, workspace_bytes)
+            plan = exact_edge_workspace_plan(
+                geometry.center_ptr_host,
+                shape,
+                self.packed_weight,
+                workspace_bytes,
+                weight_layout=PRODUCTION_EXACT_EDGE_WEIGHT_LAYOUT,
+                matmul_family=PRODUCTION_EXACT_EDGE_MATMUL_FAMILY,
+            )
+            self._prepared_exact_edge_plans[key] = plan
+            if plan is not None:
+                self._prepared_exact_edge_arguments[key] = (
+                    exact_edge_plan_argument_lists(plan)
+                )
+
+    def _exact_edge_workspace_plan(
+        self, x: Tensor, geometry: _IrrepConvGeometry,
+    ) -> ExactEdgeWorkspacePlan | None:
+        workspace_bytes = self._triton_workspace_bytes()
+        key = (int(x.shape[0]), x.dtype, workspace_bytes)
+        if key in self._prepared_exact_edge_plans:
+            return self._prepared_exact_edge_plans[key]
+        return exact_edge_workspace_plan(
+            geometry.center_ptr_host,
+            x,
+            self.packed_weight,
+            workspace_bytes,
+            weight_layout=PRODUCTION_EXACT_EDGE_WEIGHT_LAYOUT,
+            matmul_family=PRODUCTION_EXACT_EDGE_MATMUL_FAMILY,
+        )
+
+    def _exact_edge_plan_arguments(
+        self, x: Tensor, plan: ExactEdgeWorkspacePlan,
+    ) -> tuple[list[int], list[int], list[int], list[int]]:
+        key = (int(x.shape[0]), x.dtype, self._triton_workspace_bytes())
+        arguments = self._prepared_exact_edge_arguments.get(key)
+        if arguments is not None:
+            return arguments
+        return exact_edge_plan_argument_lists(plan)
+
+    def _exact_edge_support_reason(
+        self, x: Tensor, geometry: _IrrepConvGeometry,
+    ) -> str | None:
+        if not EXACT_EDGE_AVAILABLE:
+            return "Triton exact-edge backend is unavailable"
+        if x.dtype != torch.float32 or self.packed_weight.dtype != torch.float32:
+            return "exact-edge backend currently supports FP32 tensors only"
+        if self.num_radial != 1:
+            return "exact-edge backend only supports one radial basis (R1)"
+        if self._exact_edge_workspace_plan(x, geometry) is None:
+            return (
+                "triton_workspace_mib is too small for one bounded exact-edge "
+                "center chunk under the 128 MiB hard cap"
+            )
+        return None
 
     def _build_geometry(
         self,
@@ -820,8 +998,12 @@ class IrrepSphereConv(_RadialBasisConvBase):
                 triton_center_idx = empty_index
                 triton_neighbor_idx = empty_index
                 center_ptr = empty_index
+                # Quadrature never enters regular-R1 exact-edge dispatch.
+                center_ptr_host = (0,)
                 neighbor_ptr = empty_index
                 edges_by_neighbor = empty_index
+                max_center_degree = 0
+                max_neighbor_degree = 0
                 degree_bucket = 0
             else:
                 r = move_float(graph.r)
@@ -869,12 +1051,18 @@ class IrrepSphereConv(_RadialBasisConvBase):
                 center_counts = torch.bincount(center_idx, minlength=graph.n_points).to(torch.int32)
                 center_ptr = torch.zeros(graph.n_points + 1, device=device, dtype=torch.int32)
                 center_ptr[1:] = torch.cumsum(center_counts, dim=0)
+                # Exact-edge descriptors are planned from this immutable host
+                # copy.  The only device-to-host transfer happens during
+                # prepare_graph(), never while tracing or running forward.
+                center_ptr_host = tuple(
+                    int(value)
+                    for value in center_ptr.detach().to(device="cpu").tolist()
+                )
                 neighbor_order = torch.argsort(neighbor_idx, stable=True)
                 neighbor_counts = torch.bincount(neighbor_idx, minlength=graph.n_points).to(torch.int32)
-                max_degree = max(
-                    int(center_counts.max().item()),
-                    int(neighbor_counts.max().item()),
-                )
+                max_center_degree = int(center_counts.max().item())
+                max_neighbor_degree = int(neighbor_counts.max().item())
+                max_degree = max(max_center_degree, max_neighbor_degree)
                 degree_bucket = max(8, 1 << max(0, max_degree - 1).bit_length())
                 neighbor_ptr = torch.zeros(graph.n_points + 1, device=device, dtype=torch.int32)
                 neighbor_ptr[1:] = torch.cumsum(neighbor_counts, dim=0)
@@ -890,8 +1078,11 @@ class IrrepSphereConv(_RadialBasisConvBase):
             triton_center_idx=triton_center_idx,
             triton_neighbor_idx=triton_neighbor_idx,
             center_ptr=center_ptr,
+            center_ptr_host=center_ptr_host,
             neighbor_ptr=neighbor_ptr,
             edges_by_neighbor=edges_by_neighbor,
+            max_center_degree=max_center_degree,
+            max_neighbor_degree=max_neighbor_degree,
             degree_bucket=degree_bucket,
             neighbor_count=neighbor_count,
             transport_angle=transport_angle,
@@ -1027,13 +1218,24 @@ class IrrepSphereConv(_RadialBasisConvBase):
             )
             if reason is not None:
                 return reason
-            if self.num_radial == 1 and self.regular_r1_variant == "semi_packed":
-                return semi_packed_support_reason(
-                    x,
-                    self.packed_weight,
-                    geometry.degree_bucket,
-                    self.triton_workspace_mib << 20,
-                )
+            if self.num_radial == 1:
+                if self.regular_r1_variant == "semi_packed":
+                    return semi_packed_support_reason(
+                        x,
+                        self.packed_weight,
+                        geometry.max_center_degree,
+                        self._triton_workspace_bytes(),
+                    )
+                if self.regular_r1_variant == "exact_edge":
+                    if torch.is_grad_enabled() and (
+                        x.requires_grad or self.packed_weight.requires_grad
+                    ):
+                        return (
+                            "regular_r1_variant='exact_edge' is inference-only; "
+                            "disable autograd or choose 'auto', 'fused', or "
+                            "'semi_packed'"
+                        )
+                    return self._exact_edge_support_reason(x, geometry)
             return None
         for out_order in self._out_orders:
             for in_order in self._in_orders:
@@ -1050,6 +1252,17 @@ class IrrepSphereConv(_RadialBasisConvBase):
     def _should_use_triton(self, x: Tensor, geometry: _IrrepConvGeometry) -> bool:
         if self.backend == "torch":
             return False
+        if (
+            self.regular_r1_variant == "exact_edge"
+            and self.num_radial == 1
+            and self._regular_weights
+            and torch.is_grad_enabled()
+            and (x.requires_grad or self.packed_weight.requires_grad)
+        ):
+            raise RuntimeError(
+                "regular_r1_variant='exact_edge' is inference-only; disable "
+                "autograd or choose 'auto', 'fused', or 'semi_packed'"
+            )
         reason = self._triton_unsupported_reason(x, geometry)
         if reason is not None:
             if self.backend == "triton":
@@ -1078,6 +1291,46 @@ class IrrepSphereConv(_RadialBasisConvBase):
         major, _minor = torch.cuda.get_device_capability(x.device)
         allow_tf32 = bool(major >= 8 and torch.backends.cuda.matmul.allow_tf32)
         variant = self._selected_regular_r1_variant(x, geometry)
+        if variant == "exact_edge":
+            workspace_bytes = self._triton_workspace_bytes()
+            plan = self._exact_edge_workspace_plan(x, geometry)
+            if plan is None:
+                raise RuntimeError(
+                    "triton_workspace_mib is too small for one bounded "
+                    "exact-edge center chunk under the 128 MiB hard cap"
+                )
+            point_starts, point_counts, edge_starts, edge_counts = (
+                self._exact_edge_plan_arguments(x, plan)
+            )
+            return record_region_call(
+                "op/conv.triton_exact_edge",
+                exact_edge_irrep_conv,
+                x,
+                self.packed_weight,
+                geometry.triton_neighbor_idx,
+                geometry.center_ptr,
+                geometry.radial_basis,
+                geometry.input_rotation_cos,
+                geometry.input_rotation_sin,
+                geometry.output_rotation_cos,
+                geometry.output_rotation_sin,
+                self._triton_input_pack_index,
+                self._triton_output_pack_index,
+                geometry.neighbor_count,
+                point_starts,
+                point_counts,
+                edge_starts,
+                edge_counts,
+                plan.edge_capacity,
+                plan.point_capacity,
+                plan.max_center_degree,
+                False,
+                False,
+                True,
+                self.normalize_by_neighbors,
+                allow_tf32,
+                workspace_bytes,
+            )
         if variant == "semi_packed":
             return record_region_call(
                 "op/conv.triton_semi_packed",
@@ -1097,10 +1350,12 @@ class IrrepSphereConv(_RadialBasisConvBase):
                 self._triton_input_pack_index,
                 self._triton_output_pack_index,
                 geometry.neighbor_count,
+                geometry.max_center_degree,
+                geometry.max_neighbor_degree,
                 geometry.degree_bucket,
                 self.normalize_by_neighbors,
                 allow_tf32,
-                self.triton_workspace_mib << 20,
+                self._triton_workspace_bytes(),
             )
         return record_region_call(
             "op/conv.triton_fused",
@@ -1129,27 +1384,49 @@ class IrrepSphereConv(_RadialBasisConvBase):
         self,
         x: Tensor,
         geometry: _IrrepConvGeometry,
-    ) -> Literal["fused", "semi_packed"]:
+    ) -> Literal["fused", "semi_packed", "exact_edge"]:
         """Resolve the regular R1 implementation without synchronizing CUDA."""
 
         if self.num_radial != 1 or not self._regular_weights:
             return "fused"
         if self.regular_r1_variant == "fused":
             return "fused"
-        workspace_bytes = self.triton_workspace_mib << 20
+        workspace_bytes = self._triton_workspace_bytes()
+        training = torch.is_grad_enabled() and (
+            x.requires_grad or self.packed_weight.requires_grad
+        )
+        if self.regular_r1_variant == "exact_edge":
+            if training:
+                raise RuntimeError(
+                    "regular_r1_variant='exact_edge' is inference-only; "
+                    "disable autograd or choose 'auto', 'fused', or "
+                    "'semi_packed'"
+                )
+            reason = self._exact_edge_support_reason(x, geometry)
+            if reason is not None:
+                raise RuntimeError(reason)
+            return "exact_edge"
         reason = semi_packed_support_reason(
-            x, self.packed_weight, geometry.degree_bucket, workspace_bytes,
+            x, self.packed_weight, geometry.max_center_degree, workspace_bytes,
         )
         if self.regular_r1_variant == "semi_packed":
             if reason is not None:
                 raise RuntimeError(reason)
             return "semi_packed"
+        if not training and should_use_exact_edge_plan(
+            x,
+            self.packed_weight,
+            self._exact_edge_workspace_plan(x, geometry),
+            training=training,
+        ):
+            return "exact_edge"
         if reason is None and should_use_semi_packed(
-            x, self.packed_weight, geometry.degree_bucket, workspace_bytes,
-            training=(
-                torch.is_grad_enabled()
-                and (x.requires_grad or self.packed_weight.requires_grad)
-            ),
+            x,
+            self.packed_weight,
+            geometry.max_center_degree,
+            geometry.degree_bucket,
+            workspace_bytes,
+            training=training,
         ):
             return "semi_packed"
         return "fused"

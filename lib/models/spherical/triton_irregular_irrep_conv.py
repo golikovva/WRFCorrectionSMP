@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from ._triton_layout import fix_triton_strides
+
 from .triton_irrep_conv import (
     MAX_MULTIPLICITY,
     MAX_ORDER,
@@ -1284,6 +1286,8 @@ if TRITON_AVAILABLE and triton_op is not None:
         use_r1_fast_path: bool,
         allow_tf32: bool,
     ) -> Tensor:
+        x = fix_triton_strides(x)
+        weight = fix_triton_strides(weight)
         del center_idx, neighbor_ptr, edges_by_neighbor
         radial, out_m, _in_m, out_dim, _in_dim = map(int, weight.shape)
         batch, n_points = int(x.shape[0]), int(x.shape[1])
@@ -1380,6 +1384,9 @@ if TRITON_AVAILABLE and triton_op is not None:
         use_r1_fast_path: bool,
         allow_tf32: bool,
     ) -> tuple[Tensor, Tensor]:
+        grad_out = fix_triton_strides(grad_out)
+        x = fix_triton_strides(x)
+        weight = fix_triton_strides(weight)
         del center_ptr
         radial, out_m, in_m, out_dim, in_dim = map(int, weight.shape)
         batch, n_points = int(x.shape[0]), int(x.shape[1])

@@ -67,6 +67,28 @@ class IrrepSphereUnpool(nn.Module):
     def __init__(self, field_type: SO2IrrepFieldType) -> None:
         super().__init__()
         self.field_type = field_type
+        self._prepared_pooler: SpherePooler | SphereWeightedPooler | None = None
+
+    def prepare_pooler(self, pooler: SpherePooler | SphereWeightedPooler) -> None:
+        """Validate static geometry before compiling; reprepare after any mutation."""
+        self.clear_prepared_pooler()
+        if isinstance(pooler, SphereWeightedPooler):
+            fine_weight = pooler.weight.new_zeros(pooler.fine_graph.n_points)
+            fine_weight.scatter_add_(0, pooler.fine_idx, pooler.weight)
+            self._validate_fine_weight(fine_weight)
+        self._prepared_pooler = pooler
+
+    def clear_prepared_pooler(self) -> None:
+        self._prepared_pooler = None
+
+    def _apply(self, fn, recurse: bool = True):
+        self.clear_prepared_pooler()
+        return super()._apply(fn, recurse=recurse)
+
+    @staticmethod
+    def _validate_fine_weight(fine_weight: Tensor) -> None:
+        if torch.any(~torch.isfinite(fine_weight) | (fine_weight <= 0)):
+            raise ValueError("weighted pooler must cover every fine point with finite positive weight")
 
     def forward(
         self,
@@ -103,8 +125,19 @@ class IrrepSphereUnpool(nn.Module):
 
         fine_weight = x.new_zeros(pooler.fine_graph.n_points)
         fine_weight.scatter_add_(0, fine_idx, weight)
-        if torch.any(fine_weight <= 0):
-            raise ValueError("weighted pooler must cover every fine point")
+        # Data-dependent validation runs during preparation for a compiled
+        # call. Eager calls keep validating, including in-place geometry changes.
+        if not torch.compiler.is_compiling():
+            self._validate_fine_weight(fine_weight)
+        elif (
+            pooler is not self._prepared_pooler
+            or pooler.weight.device != x.device
+            or pooler.weight.dtype != x.dtype
+        ):
+            raise RuntimeError(
+                "weighted pooler is not prepared for this device/dtype; "
+                "call prepare_pooler() before compiling"
+            )
 
         outputs = []
         for order in self.field_type.orders:
@@ -142,7 +175,9 @@ class _IrrepSphereDoubleConv(nn.Module):
         quadrature_angular: int,
         quadrature_sigma_km: float | None,
         irrep_conv_backend: Literal["auto", "torch", "triton"],
-        regular_r1_variant: Literal["auto", "fused", "semi_packed"] = "auto",
+        regular_r1_variant: Literal[
+            "auto", "fused", "semi_packed", "exact_edge"
+        ] = "auto",
         triton_workspace_mib: int = 512,
     ) -> None:
         super().__init__()
@@ -239,7 +274,9 @@ class IrrepSphereUNet(nn.Module):
         quadrature_angular: int = 16,
         quadrature_sigma_km: float | None = None,
         irrep_conv_backend: Literal["auto", "torch", "triton"] = "auto",
-        regular_r1_variant: Literal["auto", "fused", "semi_packed"] = "auto",
+        regular_r1_variant: Literal[
+            "auto", "fused", "semi_packed", "exact_edge"
+        ] = "auto",
         triton_workspace_mib: int = 512,
     ) -> None:
         super().__init__()
@@ -265,7 +302,10 @@ class IrrepSphereUNet(nn.Module):
         self.max_order = hidden_max_order
         self.irrep_conv_backend = str(irrep_conv_backend)
         self.regular_r1_variant = str(regular_r1_variant)
-        self.triton_workspace_mib = int(triton_workspace_mib)
+        validated_workspace_mib = IrrepSphereConv._validate_triton_workspace_mib(
+            triton_workspace_mib
+        )
+        self.triton_workspace_mib = validated_workspace_mib
         self.level_types = tuple(
             SO2IrrepFieldType.balanced(hidden_max_order, width) for width in widths
         )
@@ -283,7 +323,7 @@ class IrrepSphereUNet(nn.Module):
             "quadrature_sigma_km": quadrature_sigma_km,
             "irrep_conv_backend": irrep_conv_backend,
             "regular_r1_variant": regular_r1_variant,
-            "triton_workspace_mib": triton_workspace_mib,
+            "triton_workspace_mib": validated_workspace_mib,
         }
         encoder_in_types = (in_type, *self.level_types[:-1])
         self.encoder_blocks = nn.ModuleList(
@@ -341,6 +381,8 @@ class IrrepSphereUNet(nn.Module):
     def prepare_hierarchy(self, hierarchy: SphereGraphHierarchy) -> None:
         self._validate_hierarchy(hierarchy)
         self.clear_prepared_hierarchy()
+        for unpool, pooler in zip(self.unpool_layers, reversed(hierarchy.poolers[:3])):
+            unpool.prepare_pooler(pooler)
 
         banks = []
         for graph, convolutions in zip(hierarchy.graphs[:4], self._convolutions_by_level()):
@@ -389,6 +431,8 @@ class IrrepSphereUNet(nn.Module):
         for block in self.decoder_blocks:
             block.clear_prepared_graph()
         self.output_conv.clear_prepared_graph()
+        for unpool in self.unpool_layers:
+            unpool.clear_prepared_pooler()
         self._geometry_banks = ()
         self._prepared_hierarchy = None
 
