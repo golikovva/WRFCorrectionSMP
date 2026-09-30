@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from numbers import Integral
 from typing import Literal, Sequence
 
 import torch
@@ -357,11 +358,30 @@ class SphereWeightedPooler:
 
 
 @dataclass(frozen=True)
+class HierarchyBuildSpec:
+    """Versioned construction options stored with a cached hierarchy."""
+
+    mode: Literal["fps", "equidistant"]
+    grid_shape: tuple[int, int]
+    levels: int
+    radius_km: float
+    max_neighbors: int | None
+    earth_radius_km: float
+    prefer_scipy: bool
+    frame_strategy: TangentFrameStrategy
+    pool_kernel_size: tuple[int, int] | None = None
+    pool_ratio: float | None = None
+    min_points: int | None = None
+    version: int = 1
+
+
+@dataclass(frozen=True)
 class SphereGraphHierarchy:
     """A list of sphere graphs plus equivariant poolers between them."""
 
     graphs: tuple[SphereGraphGeometry, ...]
     poolers: tuple[SpherePooler | SphereWeightedPooler, ...]
+    build_spec: HierarchyBuildSpec | None = None
 
     def __post_init__(self) -> None:
         if len(self.graphs) < 1:
@@ -450,7 +470,12 @@ class SphereGraphHierarchy:
             )
 
         poolers = tuple(move_pooler(level, pooler) for level, pooler in enumerate(self.poolers))
-        return type(self)(graphs=graphs, poolers=poolers)
+        return replace(
+            self,
+            graphs=graphs,
+            poolers=poolers,
+            build_spec=getattr(self, "build_spec", None),
+        )
 
 
 def _ico_assignment(fine_resolution: int) -> Tensor:
@@ -612,6 +637,134 @@ def _build_weighted_point_sequence_hierarchy(
 #         prefer_scipy=prefer_scipy,
 #         frame_strategy=frame_strategy,
 #     )
+
+
+def normalize_pool_kernel_size(value: int | Sequence[int]) -> tuple[int, int]:
+    """Normalize a positive integer or a two-axis pooling kernel."""
+
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        axes = (value, value)
+    elif isinstance(value, (tuple, list)) and len(value) == 2:
+        axes = tuple(value)
+    else:
+        raise ValueError("pool_kernel_size must be a positive integer or a pair of positive integers")
+    if any(isinstance(axis, bool) or not isinstance(axis, Integral) or axis < 1 for axis in axes):
+        raise ValueError("pool_kernel_size must be a positive integer or a pair of positive integers")
+    return int(axes[0]), int(axes[1])
+
+
+def build_equidistant_sphere_hierarchy(
+    grid_xyz: Tensor,
+    *,
+    levels: int,
+    radius_km: float,
+    max_neighbors: int | None,
+    pool_kernel_size: int | Sequence[int] = 2,
+    earth_radius_km: float = 6371.0,
+    prefer_scipy: bool = True,
+    frame_strategy: TangentFrameStrategy = "robust",
+) -> SphereGraphHierarchy:
+    """Coarsen a structured sphere grid by nonoverlapping average-pooling blocks.
+
+    Each transition matches AvgPool2d(kernel_size=kernel, stride=kernel,
+    padding=0, ceil_mode=True) for scalar fields, including partial border
+    blocks. Geometry is the normalized mean of the preceding level's actual
+    block points. Thus border centers need not remain equally spaced. This
+    selects topology by grid indices; it does not assert physical equidistance.
+    """
+
+    kernel = normalize_pool_kernel_size(pool_kernel_size)
+    if isinstance(levels, bool) or not isinstance(levels, Integral) or levels < 1:
+        raise ValueError("levels must be a positive integer")
+    if not math.isfinite(radius_km) or radius_km <= 0:
+        raise ValueError("radius_km must be finite and positive")
+    if not math.isfinite(earth_radius_km) or earth_radius_km <= 0:
+        raise ValueError("earth_radius_km must be finite and positive")
+    if max_neighbors is not None and (
+        isinstance(max_neighbors, bool)
+        or not isinstance(max_neighbors, Integral)
+        or max_neighbors < 1
+    ):
+        raise ValueError("max_neighbors must be a positive integer when provided")
+    if not isinstance(grid_xyz, Tensor) or not grid_xyz.is_floating_point():
+        raise ValueError("grid_xyz must be a floating-point tensor with shape [H, W, 3]")
+    if grid_xyz.ndim != 3 or grid_xyz.shape[-1] != 3 or min(grid_xyz.shape[:2]) < 1:
+        raise ValueError("grid_xyz must have nonempty shape [H, W, 3]")
+    if not bool(torch.isfinite(grid_xyz).all()):
+        raise ValueError("grid_xyz must contain only finite coordinates")
+
+    shape = (int(grid_xyz.shape[0]), int(grid_xyz.shape[1]))
+    # Scaling before normalization also accepts very small nonzero input vectors.
+    points = grid_xyz.detach().cpu().reshape(-1, 3).to(torch.float64)
+    magnitude = points.abs().amax(dim=-1, keepdim=True)
+    if bool((magnitude == 0).any()):
+        raise ValueError("grid_xyz must not contain zero-length vectors")
+    points = torch.nn.functional.normalize(points / magnitude, dim=-1).to(grid_xyz.dtype)
+
+    graphs: list[SphereGraphGeometry] = []
+    assignments: list[Tensor] = []
+    radius_cap = math.pi * float(earth_radius_km)
+    level_radius = min(float(radius_km), radius_cap)
+    radius_growth = math.sqrt(kernel[0] * kernel[1])
+    center_tolerance = max(1e-12, 8 * torch.finfo(points.dtype).eps)
+
+    for level in range(int(levels)):
+        graph = SphereGraphGeometry.from_points(
+            points,
+            radius_km=level_radius,
+            earth_radius_km=float(earth_radius_km),
+            max_neighbors=max_neighbors,
+            lat_shape=shape,
+            prefer_scipy=prefer_scipy,
+            frame_strategy=frame_strategy,
+        )
+        graphs.append(graph)
+        if level == levels - 1:
+            break
+
+        height, width = shape
+        coarse_shape = (
+            (height + kernel[0] - 1) // kernel[0],
+            (width + kernel[1] - 1) // kernel[1],
+        )
+        rows = torch.arange(height, dtype=torch.long) // kernel[0]
+        columns = torch.arange(width, dtype=torch.long) // kernel[1]
+        assignment = (rows[:, None] * coarse_shape[1] + columns[None, :]).reshape(-1)
+        n_coarse = coarse_shape[0] * coarse_shape[1]
+        count = torch.bincount(assignment, minlength=n_coarse)
+        centers = _scatter_mean(
+            graph.points_xyz.to(torch.float64).unsqueeze(0),
+            assignment,
+            count,
+            n_coarse,
+        ).squeeze(0)
+        norms = torch.linalg.vector_norm(centers, dim=-1, keepdim=True)
+        if bool((norms <= center_tolerance).any()):
+            raise ValueError(
+                f"level {level + 1} contains a block with a near-zero mean direction; "
+                "its spherical center is undefined"
+            )
+        points = (centers / norms).to(points.dtype)
+        assignments.append(assignment)
+        shape = coarse_shape
+        level_radius = min(radius_cap, level_radius * radius_growth)
+
+    poolers = tuple(
+        SpherePooler.from_assignment(fine, coarse, assignment)
+        for fine, coarse, assignment in zip(graphs, graphs[1:], assignments)
+    )
+    build_spec = HierarchyBuildSpec(
+        mode="equidistant",
+        grid_shape=(int(grid_xyz.shape[0]), int(grid_xyz.shape[1])),
+        levels=int(levels),
+        radius_km=float(radius_km),
+        max_neighbors=int(max_neighbors) if max_neighbors is not None else None,
+        earth_radius_km=float(earth_radius_km),
+        prefer_scipy=bool(prefer_scipy),
+        frame_strategy=frame_strategy,
+        pool_kernel_size=kernel,
+    )
+    return SphereGraphHierarchy(graphs=tuple(graphs), poolers=poolers, build_spec=build_spec)
 
 
 def build_fps_sphere_hierarchy(
