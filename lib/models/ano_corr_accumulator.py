@@ -1,6 +1,15 @@
+import json
+from collections.abc import Sequence
+from numbers import Integral
+from pathlib import Path
+
 import numpy as np
 import torch
 from torch import nn
+
+
+_UNSET = object()
+DEFAULT_SEASON_MONTHS = ((12, 1, 2), (3, 4, 5), (6, 7, 8), (9, 10, 11))
 
 
 class ANOCorrector(nn.Module):
@@ -15,19 +24,47 @@ class ANOCorrector(nn.Module):
 
     def __init__(
         self,
-        start_date=None,
-        time_mean_period="day",
+        start_date=_UNSET,
+        time_mean_period=_UNSET,
         *,
         period=None,
-        n_channels=3,
-        time_dim=0,
-        batch_dim=1,
-        time_step_hours=1,
-        dtype=torch.float32,
+        season_months: Sequence[Sequence[int]] | None = None,
+        n_channels=_UNSET,
+        time_dim=_UNSET,
+        batch_dim=_UNSET,
+        time_step_hours=_UNSET,
+        dtype=_UNSET,
     ):
         super().__init__()
+        # Remember actual caller constraints so loading a self-contained archive
+        # can restore defaults while rejecting incompatible explicit settings.
+        supplied = {
+            "start_date": start_date,
+            "time_mean_period": time_mean_period,
+            "n_channels": n_channels,
+            "time_dim": time_dim,
+            "batch_dim": batch_dim,
+            "time_step_hours": time_step_hours,
+            "dtype": dtype,
+        }
+        self._explicit_parameters = {key for key, value in supplied.items() if value is not _UNSET}
+        if period is not None:
+            self._explicit_parameters.add("time_mean_period")
+        if season_months is not None:
+            self._explicit_parameters.add("season_months")
+        start_date = None if start_date is _UNSET else start_date
+        time_mean_period = "day" if time_mean_period is _UNSET else time_mean_period
+        n_channels = 3 if n_channels is _UNSET else n_channels
+        time_dim = 0 if time_dim is _UNSET else time_dim
+        batch_dim = 1 if batch_dim is _UNSET else batch_dim
+        time_step_hours = 1 if time_step_hours is _UNSET else time_step_hours
+        dtype = torch.float32 if dtype is _UNSET else dtype
         self.start_date = None if start_date is None else np.datetime64(start_date)
         self.period = self._normalize_period(period or time_mean_period)
+        self.season_months = self._normalize_season_months(season_months)
+        self._month_to_season = np.empty(12, dtype=np.int64)
+        for index, months in enumerate(self.season_months):
+            self._month_to_season[np.asarray(months) - 1] = index
         self.n_channels = int(n_channels)
         self.time_dim = time_dim
         self.batch_dim = batch_dim
@@ -47,15 +84,36 @@ class ANOCorrector(nn.Module):
             "doy": "day",
             "monthly": "month",
             "mon": "month",
+            "seasonal": "season",
             "constant": "all",
             "global": "all",
         }
         period = aliases.get(period, period)
-        if period not in {"day", "month", "all"}:
-            raise ValueError(f"Unsupported ANO period: {period!r}. Use 'day', 'month' or 'all'.")
+        if period not in {"day", "month", "season", "all"}:
+            raise ValueError(f"Unsupported ANO period: {period!r}. Use 'day', 'month', 'season' or 'all'.")
         return period
 
+    @staticmethod
+    def _normalize_season_months(season_months):
+        if season_months is None:
+            return DEFAULT_SEASON_MONTHS
+        try:
+            groups = tuple(tuple(group) for group in season_months)
+        except TypeError as exc:
+            raise ValueError("season_months must be a sequence of nonempty month groups.") from exc
+        months = [month for group in groups for month in group]
+        if (
+            not groups
+            or any(not group for group in groups)
+            or any(isinstance(month, (bool, np.bool_)) or not isinstance(month, Integral) for month in months)
+            or sorted(months) != list(range(1, 13))
+        ):
+            raise ValueError("season_months must contain nonempty groups covering months 1..12 exactly once.")
+        return tuple(tuple(int(month) for month in group) for group in groups)
+
     def _get_range(self):
+        if self.period == "season":
+            return len(self.season_months)
         if self.period == "month":
             return 12
         if self.period == "day":
@@ -68,7 +126,12 @@ class ANOCorrector(nn.Module):
             return dates.astype(np.int64)
 
         if np.issubdtype(dates.dtype, np.datetime64):
-            if self.period == "month":
+            if np.isnat(dates).any():
+                raise ValueError("ANO dates must not contain NaT.")
+            if self.period == "season":
+                months = dates.astype("datetime64[M]").astype(int) % 12
+                periods = self._month_to_season[months]
+            elif self.period == "month":
                 periods = dates.astype("datetime64[M]").astype(int) % 12
             elif self.period == "day":
                 days = dates.astype("datetime64[D]")
@@ -234,10 +297,95 @@ class ANOCorrector(nn.Module):
         return data_channels + correction
 
     def save_correction_fields(self, path):
-        np.save(path, self._get_mean_corrections())
+        """Save resumable state to .npz, or legacy mean-only fields to .npy."""
+        if Path(path).suffix.lower() == ".npz":
+            metadata = {"format_version": 1, "config": self._configuration()}
+            np.savez(
+                path,
+                correction_sums=self.correction_sums.detach().cpu().numpy(),
+                period_counts=self.period_counts.detach().cpu().numpy(),
+                metadata=np.asarray(json.dumps(metadata)),
+            )
+        else:
+            np.save(path, self._get_mean_corrections())
+
+    def _configuration(self):
+        return {
+            "start_date": None if self.start_date is None else str(self.start_date.astype("datetime64[ns]")),
+            "time_mean_period": self.period,
+            "season_months": [list(months) for months in self.season_months],
+            "n_channels": self.n_channels,
+            "time_dim": self.time_dim,
+            "batch_dim": self.batch_dim,
+            "time_step_hours": self.time_step_hours,
+            "dtype": str(self.accumulator_dtype).removeprefix("torch."),
+        }
+
+    def _load_archive(self, archive, *, nan_to_num):
+        required = {"correction_sums", "period_counts", "metadata"}
+        if not required.issubset(archive.files):
+            raise ValueError("ANO .npz archive must contain correction_sums, period_counts and metadata.")
+        try:
+            metadata = json.loads(archive["metadata"].item())
+            config = metadata["config"]
+            if metadata["format_version"] != 1 or set(config) != set(self._configuration()):
+                raise ValueError("Unsupported ANO archive format or model configuration.")
+            kwargs = dict(config)
+            kwargs["dtype"] = getattr(torch, kwargs["dtype"], None)
+            if not isinstance(kwargs["dtype"], torch.dtype):
+                raise ValueError("Unsupported accumulator dtype in ANO archive.")
+            restored = ANOCorrector(**kwargs)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid ANO archive metadata: {exc}") from exc
+
+        current_config = self._configuration()
+        restored_config = restored._configuration()
+        for name in self._explicit_parameters:
+            if current_config[name] != restored_config[name]:
+                raise ValueError(
+                    f"Explicit ANO parameter {name!r}={current_config[name]!r} conflicts "
+                    f"with saved value {restored_config[name]!r}."
+                )
+
+        sums = archive["correction_sums"]
+        counts = archive["period_counts"]
+        empty = sums.shape == (0,) and not np.any(counts)
+        if not empty and (sums.ndim != 4 or sums.shape[0] != restored.period_range):
+            raise ValueError("ANO archive correction_sums must have shape (period, C, H, W).")
+        if (
+            counts.shape != (restored.period_range,)
+            or not np.issubdtype(counts.dtype, np.number)
+            or not np.isfinite(counts).all()
+            or (counts < 0).any()
+            or (counts != np.floor(counts)).any()
+        ):
+            raise ValueError("ANO archive period_counts must contain one finite nonnegative integer per period.")
+        if nan_to_num:
+            sums = np.nan_to_num(sums)
+        device = self.period_counts.device
+        sums_tensor = torch.as_tensor(sums, dtype=restored.accumulator_dtype, device=device).clone()
+        counts_tensor = torch.as_tensor(counts, dtype=torch.float32, device=device).clone()
+
+        # Do not change the receiving model until metadata and arrays validate.
+        for name in (
+            "start_date", "period", "season_months", "_month_to_season", "n_channels",
+            "time_dim", "batch_dim", "time_step_hours", "accumulator_dtype", "period_range",
+        ):
+            setattr(self, name, getattr(restored, name))
+        self.correction_sums = sums_tensor
+        self.period_counts = counts_tensor
+        return self
 
     def load_correction_fields(self, path, *, nan_to_num=True):
-        fields = np.load(path)
+        """Restore .npz configuration/state, rejecting explicit parameter conflicts.
+
+        Legacy .npy files only contain means and therefore use the model's
+        configured periods, with a count of one for each loaded mean.
+        """
+        fields = np.load(path, allow_pickle=False)
+        if isinstance(fields, np.lib.npyio.NpzFile):
+            with fields as archive:
+                return self._load_archive(archive, nan_to_num=nan_to_num)
         if nan_to_num:
             fields = np.nan_to_num(fields, copy=False)
 
