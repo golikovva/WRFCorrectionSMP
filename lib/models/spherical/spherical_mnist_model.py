@@ -10,6 +10,7 @@ from torch import Tensor, nn
 
 from ...data.spherical.sphere_graph import SphereGraphGeometry
 from ...data.spherical.sphere_hierarchy import SphereGraphHierarchy, SpherePooler, SphereWeightedPooler
+from .assignment_pool import AssignmentPlan, deterministic_pool_assignment
 from .irrep_layers import (
     IrrepBatchNorm,
     IrrepSphereConv,
@@ -75,6 +76,11 @@ class IrrepSphereGraphPool(nn.Module):
         super().__init__()
         self.field_type = field_type
         self.edge_chunk_size = int(edge_chunk_size)
+        self._deterministic_assignment_plan: AssignmentPlan | None = None
+
+    def _apply(self, fn, recurse: bool = True):
+        self._deterministic_assignment_plan = None
+        return super()._apply(fn, recurse=recurse)
 
     def forward(self, x: Tensor, graph: SphereGraphGeometry) -> Tensor:
         if x.ndim != 3 or int(x.shape[-1]) != self.field_type.total_dim:
@@ -130,6 +136,10 @@ class IrrepSphereGraphPool(nn.Module):
         return self._pool_assignment(x, pooler)
 
     def _pool_assignment(self, x: Tensor, pooler: SpherePooler) -> Tensor:
+        # Prepared U-Nets bind a shared plan. Standalone eager pooling retains
+        # its original path and does not require a new public setup call.
+        if getattr(self, "_deterministic_assignment_plan", None) is not None:
+            return deterministic_pool_assignment(self, x, pooler)
         if int(x.shape[1]) != pooler.fine_graph.n_points:
             raise ValueError(f"x has {x.shape[1]} points, expected {pooler.fine_graph.n_points}")
         assignment = pooler.assignment.to(device=x.device)
