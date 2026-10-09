@@ -14,6 +14,8 @@ import xarray as xr
 from addict import Dict
 from torch.utils.data import Dataset
 
+from lib.data.availability import plan_sequence_slices
+
 
 def atleast_nd(arr, n):
     """
@@ -133,25 +135,18 @@ class NCs2sDataset(Dataset):
         return l if l > 0 else 0
 
     def get_data_by_id(self, date, length=None):
-        needed_len = self.seq_len if length is None else length
-        npys = []
-        # print(date, 'input date')
-        hours_in_file = get_hours_in_period(date, self._file_len)
-        hour = (date.astype('datetime64[h]') - date.astype(f'datetime64[{self._file_len}]')).astype(int)
-        file = date.astype(f'datetime64[{self._file_len}]')
-        # print(hour, file, 'hour file')
-        while needed_len > 0:
-            times = np.arange(0, get_hours_in_period(date, self._file_len))[hour:hour + needed_len*self.time_res_h:self.time_res_h]
+        length = self.seq_len if length is None else length
+        chunks = []
+        for selection in plan_sequence_slices(date, length, self.time_res_h, self._file_len):
             try:
-                file_vars = self.load_file_vars(str(self.dates_dict[file][0]), self.data_variables, times)
+                filename = self.dates_dict[selection.file_date][0]
+                values = self.load_file_vars(str(filename), self.data_variables, selection.indices)
             except (IndexError, KeyError):
                 return None
-            hour = self.time_res_h - (hours_in_file-times[-1])
-            file = file + np.timedelta64(1 + hour // hours_in_file, self._file_len)
-            hour = hour % hours_in_file
-            npys.append(file_vars)
-            needed_len -= len(file_vars)
-        return np.concatenate(npys) 
+            if values is None or len(values) != len(selection.indices):
+                return None
+            chunks.append(values)
+        return np.concatenate(chunks, axis=0)
 
     def __getitem__(self, date, length=None, add_coords=None, add_time_encoding=None):
         data = [self.get_data_by_id(date, length)]
@@ -848,7 +843,10 @@ def dataset_with_indices(cls):
     """
 
     def __getitem__(self, index):
-        data = cls.__getitem__(self, index)
+        try:
+            data = cls.__getitem__(self, index)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load date {index}: {type(exc).__name__}: {exc}") from exc
         return data, index
 
     return type(cls.__name__, (cls,), {

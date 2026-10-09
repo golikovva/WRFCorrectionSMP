@@ -2,6 +2,7 @@ import os
 import sys
 import yaml
 import ast
+from functools import partial
 
 sys.path.insert(0, '../../')
 
@@ -15,6 +16,8 @@ from lib.models.loss import HeterogenousMSLoss
 from lib.models.changeToERA5 import ClusterMapper
 from lib.data.train_test_split import split_dates_dispatch
 from lib.data.data_utils import variable_len_collate, Sampler
+from lib.data.training_batches import strict_train_collate
+from lib.data.training_dates import prepare_valid_train_dates
 from lib.data.datasets import (
     WRFs2sDataset,
     ERAs2sDataset,
@@ -160,11 +163,22 @@ def main(
     train_days, val_days, test_days = split_dates_dispatch(**cfg.split_config)
     test_days = test_days[::max_sl]
 
+    training_enabled = 'train' in str(cfg.run_config.run_mode).lower()
+    required_train_sources = [cfg.reference_dataset, cfg.target_dataset]
+    if cfg.run_config.use_stations:
+        required_train_sources.append('Stations')
+    if training_enabled:
+        train_days = prepare_valid_train_dates(
+            dataset, train_days, logger.save_dir,
+            batch_size=cfg.run_config.batch_size,
+        )
+
     train_sampler = Sampler(
         train_days,
         shuffle=True,
         distributed=distributed_is_initialized(),
         seed=int(global_seed or 0),
+        batch_size=cfg.run_config.batch_size if training_enabled else None,
     )
     val_sampler = Sampler(
         val_days,
@@ -173,14 +187,20 @@ def main(
         pad=False,
     )
     test_sampler = Sampler(test_days, shuffle=False)
-    collate_fn = variable_len_collate if cfg.run_config.variable_sequence_length else variable_len_collate
+    collate_fn = variable_len_collate
+    train_collate_fn = partial(
+        strict_train_collate,
+        required_sources=tuple(required_train_sources),
+        sequence_length=max_sl,
+        expected_batch_size=cfg.run_config.batch_size,
+    ) if training_enabled else collate_fn
 
     train_dataloader = DataLoader(
         dataset,
         batch_size=cfg.run_config.batch_size,
         num_workers=cfg.run_config.num_workers,
         sampler=train_sampler,
-        collate_fn=collate_fn,
+        collate_fn=train_collate_fn,
         pin_memory=True,
     )
     valid_dataloader = DataLoader(

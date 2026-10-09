@@ -788,13 +788,16 @@ def split_dates_dispatch(
         train_pool = development_dates[
             ~np.isin(development_dates, validation_dates)
         ]
-        train_dates = sample_seasonally_balanced_nested_dates(
-            train_pool,
-            blocks_per_season=blocks_per_season,
-            block_size=block_size,
-            seed=seed,
-            require_complete_blocks=require_complete_blocks,
-        )
+        if blocks_per_season == 'all':
+            train_dates = train_pool
+        else:
+            train_dates = sample_seasonally_balanced_nested_dates(
+                train_pool,
+                blocks_per_season=blocks_per_season,
+                block_size=block_size,
+                seed=seed,
+                require_complete_blocks=require_complete_blocks,
+            )
         return train_dates, validation_dates, test_dates
 
     raise ValueError(

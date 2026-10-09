@@ -502,6 +502,9 @@ def run_pipeline(
             f"stage_{stage_idx:02d}_{_sanitize_path_part(stage_name)}",
         )
 
+        # Clear compiler state so independent stages do not share recompile limits.
+        torch.compiler.reset()
+
         stage_result = single_stage_main(
             stage_base_cfg,
             results=None,

@@ -75,44 +75,63 @@ def find_files(directory, pattern):
 
 
 class Sampler:
-    def __init__(self, days, shuffle=False, distributed=False, seed=0, pad=True):
+    def __init__(self, days, shuffle=False, distributed=False, seed=0, pad=True, batch_size=None):
         self.days = days
         self.shuffle = shuffle
         self.distributed = distributed
         self.seed = int(seed)
         self.pad = pad
+        self.batch_size = batch_size
         self.epoch = 0
+        if batch_size is not None:
+            if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size <= 0:
+                raise ValueError("batch_size must be a positive integer")
+            if not pad:
+                raise ValueError("batch_size requires pad=True for full training batches")
+            if not len(days):
+                raise ValueError("No valid training dates are available")
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
     def __len__(self):
+        replicas = 1
         if self.distributed:
             from lib.distributed import rank, world_size
-            if self.pad:
-                return int(np.ceil(len(self.days) / world_size()))
             replicas = world_size()
+        if self.batch_size is not None:
+            global_batch = replicas * self.batch_size
+            return ((len(self.days) + global_batch - 1) // global_batch) * self.batch_size
+        if self.distributed:
+            if self.pad:
+                return int(np.ceil(len(self.days) / replicas))
             return max(0, (len(self.days) - rank() + replicas - 1) // replicas)
         return len(self.days)
 
     def __iter__(self):
         ids = np.arange(len(self.days))
         if self.shuffle:
-            if self.distributed:
+            if self.distributed or self.batch_size is not None:
                 rng = np.random.default_rng(self.seed + self.epoch)
                 rng.shuffle(ids)
             else:
                 np.random.shuffle(ids)
+        replicas, current_rank = 1, 0
         if self.distributed:
             from lib.distributed import rank, world_size
-            replicas = world_size()
+            replicas, current_rank = world_size(), rank()
+        if self.batch_size is not None:
+            total_size = len(self) * replicas
+        else:
             samples_per_rank = int(np.ceil(len(ids) / replicas))
             total_size = samples_per_rank * replicas if self.pad else len(ids)
-            if self.pad and total_size > len(ids):
-                ids = np.concatenate([ids, np.resize(ids, total_size - len(ids))])
-            ids = ids[rank():total_size:replicas]
+        if self.pad and total_size > len(ids):
+            ids = np.concatenate([ids, np.resize(ids, total_size - len(ids))])
+        if self.distributed:
+            ids = ids[current_rank:total_size:replicas]
         for i in ids:
             yield self.days[i]
+
 
 def _contains_none(x):
     """Recursively check if a sample contains None anywhere."""
