@@ -153,9 +153,9 @@ def _backward_phase_workspace_plan(
     available = workspace_bytes - headroom_bytes - fixed_bytes
     if n_points <= 0 or available < bytes_per_point:
         return None
-    chunk_points = min(n_points, available // bytes_per_point)
-    if chunk_points >= 32:
-        chunk_points = max(32, (chunk_points // 32) * 32)
+    max_chunk_points = min(n_points, available // bytes_per_point)
+    num_chunks = (n_points + max_chunk_points - 1) // max_chunk_points
+    chunk_points = (n_points + num_chunks - 1) // num_chunks
     matrix_bytes = chunk_points * bytes_per_point
     allocated_bytes = matrix_bytes + fixed_bytes
     if (
