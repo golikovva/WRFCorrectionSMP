@@ -1,0 +1,1240 @@
+{
+  "schema": "irrep-correctness-matrix-v1",
+  "status": "PLANNED_NOT_RUN",
+  "scope": "Finite common and hardware-qualified cases; config families are separately expanded by registry.py. Unknown experimental source candidates remain NOT_RUN.",
+  "defaults": {
+    "backend": "triton",
+    "regular_r1_variant": "fused",
+    "num_radial": 1,
+    "in_multiplicities": [
+      3,
+      3,
+      3
+    ],
+    "out_multiplicities": [
+      2,
+      2
+    ],
+    "batch": 1,
+    "dtype": "float32",
+    "execution": "eager",
+    "normalize_by_neighbors": true,
+    "include_self": false,
+    "quadrature": false,
+    "workspace_mib": 8,
+    "allow_tf32": false,
+    "autocast": false,
+    "mode": "train",
+    "autograd_enabled": true,
+    "requires_grad": {
+      "input": true,
+      "weights": true
+    },
+    "operations": [
+      "forward",
+      "grad_input",
+      "grad_weight"
+    ],
+    "seed": 137,
+    "fixture_id": "asymmetric_small",
+    "expected_outcome": "NUMERICAL_PARITY",
+    "actual_backend": null
+  },
+  "fixtures": {
+    "asymmetric_small": {
+      "kind": "directed_graph",
+      "n_points": 17,
+      "degree_pattern": [
+        0,
+        1,
+        3,
+        7,
+        9
+      ],
+      "include_zero_degree": true,
+      "purpose": "Unequal center/neighbor degrees and odd tensor tails"
+    },
+    "ring_small": {
+      "kind": "ring",
+      "n_points": 31,
+      "degree": 5,
+      "purpose": "Deterministic small differentiable oracle"
+    },
+    "ring_degree_boundary": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 17,
+      "purpose": "Degree bucket 16/32 and masked tails"
+    },
+    "zero_degree": {
+      "kind": "empty_edges",
+      "n_points": 11,
+      "purpose": "Exact zero spatial output/dX/dW"
+    },
+    "chunk_boundary": {
+      "kind": "ring",
+      "n_points": 1025,
+      "degree": 17,
+      "purpose": "Small workspace forces chunking for moderate channels"
+    },
+    "icosahedron_level1": {
+      "kind": "icosahedron",
+      "subdivisions": 1,
+      "n_points": 42,
+      "purpose": "All 60 exact node permutations"
+    },
+    "full_unet_small": {
+      "kind": "icosahedral_hierarchy",
+      "subdivisions": [
+        3,
+        2,
+        1,
+        0
+      ],
+      "n_points": [
+        642,
+        162,
+        42,
+        12
+      ],
+      "multiplicities": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "purpose": "Complete 4-level model within RTX4060 memory"
+    },
+    "production_borey": {
+      "kind": "production_config",
+      "config": "configs/experiments/no_enc_irrep_borey_1/train_test.yaml",
+      "grid_shape": [
+        210,
+        280
+      ],
+      "multiplicities": [
+        32,
+        64,
+        128,
+        256
+      ],
+      "capture_required": true
+    },
+    "production_nestp": {
+      "kind": "production_config",
+      "config": "configs/experiments/no_enc_irrep_borey_1/train_test.yaml",
+      "grid_shape": [
+        412,
+        1050
+      ],
+      "multiplicities": [
+        32,
+        64,
+        128,
+        256
+      ],
+      "capture_required": true
+    },
+    "degree_7": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 7,
+      "purpose": "Degree bucket boundary"
+    },
+    "degree_8": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 8,
+      "purpose": "Degree bucket boundary"
+    },
+    "degree_9": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 9,
+      "purpose": "Degree bucket boundary"
+    },
+    "degree_15": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 15,
+      "purpose": "Degree bucket boundary"
+    },
+    "degree_16": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 16,
+      "purpose": "Degree bucket boundary"
+    },
+    "degree_17": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 17,
+      "purpose": "Degree bucket boundary"
+    },
+    "degree_31": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 31,
+      "purpose": "Degree bucket boundary"
+    },
+    "degree_32": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 32,
+      "purpose": "Degree bucket boundary"
+    },
+    "degree_33": {
+      "kind": "ring",
+      "n_points": 67,
+      "degree": 33,
+      "purpose": "Degree bucket boundary"
+    }
+  },
+  "case_groups": [
+    {
+      "id": "torch-independent-parity",
+      "tier": "common",
+      "case": {
+        "implementation_id": "torch.blockwise",
+        "backend": "torch",
+        "fixture_id": "icosahedron_level1"
+      },
+      "axes": {
+        "num_radial": [
+          1,
+          2,
+          4
+        ],
+        "dtype": [
+          "float64",
+          "float32"
+        ],
+        "include_self": [
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "id": "torch-packed-parity",
+      "tier": "common",
+      "case": {
+        "implementation_id": "torch.packed",
+        "backend": "torch",
+        "fixture_id": "icosahedron_level1"
+      },
+      "axes": {
+        "num_radial": [
+          1,
+          2,
+          4
+        ],
+        "dtype": [
+          "float64",
+          "float32"
+        ],
+        "include_self": [
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "id": "regular-r1",
+      "tier": "common",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1"
+      },
+      "axes": {
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "normalize_by_neighbors": [
+          false,
+          true
+        ],
+        "batch": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "id": "regular-multi-radial",
+      "tier": "common",
+      "case": {
+        "implementation_id": "triton.regular.fused.multi_radial"
+      },
+      "axes": {
+        "num_radial": [
+          2,
+          3,
+          4
+        ],
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "irregular-r1-fast",
+      "tier": "common",
+      "case": {
+        "implementation_id": "triton.irregular.r1.fast",
+        "in_multiplicities": [
+          3,
+          1,
+          0,
+          2
+        ],
+        "out_multiplicities": [
+          1,
+          0,
+          2
+        ],
+        "_irregular_r1_fast_path": true
+      },
+      "axes": {
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "normalize_by_neighbors": [
+          false,
+          true
+        ],
+        "batch": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "id": "irregular-r1-generic",
+      "tier": "common",
+      "case": {
+        "implementation_id": "triton.irregular.r1.generic",
+        "in_multiplicities": [
+          3,
+          1,
+          0,
+          2
+        ],
+        "out_multiplicities": [
+          1,
+          0,
+          2
+        ],
+        "_irregular_r1_fast_path": false
+      },
+      "axes": {
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "normalize_by_neighbors": [
+          false,
+          true
+        ],
+        "batch": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "id": "irregular-multi-radial",
+      "tier": "common",
+      "case": {
+        "implementation_id": "triton.irregular.multi_radial",
+        "in_multiplicities": [
+          3,
+          1
+        ],
+        "out_multiplicities": [
+          2,
+          3,
+          1
+        ]
+      },
+      "axes": {
+        "num_radial": [
+          2,
+          3,
+          4
+        ],
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "semi-packed-r1",
+      "tier": "common",
+      "case": {
+        "implementation_id": "triton.regular.semi_packed.r1",
+        "regular_r1_variant": "semi_packed"
+      },
+      "axes": {
+        "dtype": [
+          "float32"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "normalize_by_neighbors": [
+          false,
+          true
+        ],
+        "batch": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "id": "semi-packed-chunks",
+      "tier": "boundary",
+      "case": {
+        "implementation_id": "triton.regular.semi_packed.r1",
+        "regular_r1_variant": "semi_packed",
+        "fixture_id": "chunk_boundary",
+        "in_multiplicities": [
+          17,
+          17,
+          17
+        ],
+        "out_multiplicities": [
+          13,
+          13,
+          13
+        ]
+      },
+      "axes": {
+        "workspace_mib": [
+          1,
+          8,
+          128
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "exact-edge-inference",
+      "tier": "common",
+      "case": {
+        "implementation_id": "triton.regular.exact_edge.r1",
+        "regular_r1_variant": "exact_edge",
+        "autograd_enabled": false,
+        "requires_grad": {
+          "input": false,
+          "weights": false
+        },
+        "mode": "eval",
+        "operations": [
+          "forward"
+        ]
+      },
+      "axes": {
+        "fixture_id": [
+          "asymmetric_small",
+          "zero_degree",
+          "ring_degree_boundary"
+        ],
+        "batch": [
+          1,
+          2
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "exact-edge-chunks",
+      "tier": "boundary",
+      "case": {
+        "implementation_id": "triton.regular.exact_edge.r1",
+        "regular_r1_variant": "exact_edge",
+        "autograd_enabled": false,
+        "requires_grad": {
+          "input": false,
+          "weights": false
+        },
+        "mode": "eval",
+        "operations": [
+          "forward"
+        ],
+        "fixture_id": "chunk_boundary",
+        "in_multiplicities": [
+          17,
+          17,
+          17
+        ],
+        "out_multiplicities": [
+          13,
+          13,
+          13
+        ]
+      },
+      "axes": {
+        "workspace_mib": [
+          1,
+          8,
+          128
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "order-boundary-1to1",
+      "tier": "boundary",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "in_multiplicities": [
+          2
+        ],
+        "out_multiplicities": [
+          3
+        ],
+        "fixture_id": "ring_small"
+      },
+      "axes": {
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "order-boundary-1to3",
+      "tier": "boundary",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "in_multiplicities": [
+          2
+        ],
+        "out_multiplicities": [
+          1,
+          1,
+          1
+        ],
+        "fixture_id": "ring_small"
+      },
+      "axes": {
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "order-boundary-3to1",
+      "tier": "boundary",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "in_multiplicities": [
+          2,
+          2,
+          2
+        ],
+        "out_multiplicities": [
+          3
+        ],
+        "fixture_id": "ring_small"
+      },
+      "axes": {
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "order-boundary-4to6",
+      "tier": "boundary",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "in_multiplicities": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "out_multiplicities": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "fixture_id": "ring_small"
+      },
+      "axes": {
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "order-boundary-9to9",
+      "tier": "boundary",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "in_multiplicities": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "out_multiplicities": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "fixture_id": "ring_small"
+      },
+      "axes": {
+        "dtype": [
+          "float32",
+          "float16",
+          "bfloat16"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "self-mixing",
+      "tier": "common",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "include_self": true,
+        "operations": [
+          "forward",
+          "grad_input",
+          "grad_parameters"
+        ]
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "normalize_by_neighbors": [
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "id": "gradient-needs",
+      "tier": "boundary",
+      "case": {
+        "implementation_id": "triton.regular.semi_packed.r1",
+        "regular_r1_variant": "semi_packed"
+      },
+      "axes": {
+        "requires_grad": [
+          {
+            "input": false,
+            "weights": true
+          },
+          {
+            "input": true,
+            "weights": false
+          }
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "strict-vs-tf32",
+      "tier": "precision",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "allow_tf32": true,
+        "tolerance_profile_id": "tf32-contract-v1"
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "normalize_by_neighbors": [
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "id": "quadrature-torch",
+      "tier": "theory",
+      "case": {
+        "implementation_id": "torch.quadrature",
+        "backend": "torch",
+        "quadrature": true,
+        "quadrature_radial": 2,
+        "quadrature_angular": 16,
+        "fixture_id": "icosahedron_level1",
+        "dtype": "float64",
+        "operations": [
+          "forward",
+          "grad_input",
+          "grad_parameters"
+        ]
+      },
+      "axes": {
+        "num_radial": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "id": "exact-edge-grad-rejected",
+      "tier": "contract",
+      "case": {
+        "implementation_id": "triton.regular.exact_edge.r1",
+        "regular_r1_variant": "exact_edge",
+        "expected_outcome": "EXPECTED_ERROR",
+        "expected_error_contains": "inference-only",
+        "operations": [
+          "dispatch"
+        ]
+      },
+      "axes": {
+        "mode": [
+          "train",
+          "eval"
+        ]
+      }
+    },
+    {
+      "id": "triton-float64-rejected",
+      "tier": "contract",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "dtype": "float64",
+        "expected_outcome": "EXPECTED_ERROR",
+        "expected_error_contains": "unsupported input dtype",
+        "operations": [
+          "dispatch"
+        ]
+      },
+      "axes": {}
+    },
+    {
+      "id": "triton-quadrature-rejected",
+      "tier": "contract",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "quadrature": true,
+        "expected_outcome": "EXPECTED_ERROR",
+        "expected_error_contains": "quadrature=False",
+        "operations": [
+          "dispatch"
+        ]
+      },
+      "axes": {}
+    },
+    {
+      "id": "triton-gradgrad-rejected",
+      "tier": "contract",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "create_graph": true,
+        "expected_outcome": "EXPECTED_ERROR",
+        "expected_error_contains": "higher-order gradients",
+        "operations": [
+          "gradgrad"
+        ]
+      },
+      "axes": {}
+    },
+    {
+      "id": "auto-observation",
+      "tier": "dispatch",
+      "case": {
+        "implementation_id": "dispatch.auto",
+        "backend": "auto",
+        "regular_r1_variant": "auto",
+        "operations": [
+          "dispatch"
+        ],
+        "expected_outcome": "DISPATCH_CONTRACT"
+      },
+      "axes": {
+        "dtype": [
+          "float32",
+          "float64"
+        ],
+        "mode": [
+          "eval",
+          "train"
+        ],
+        "autograd_enabled": [
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "id": "h100-d17_dx",
+      "tier": "h100_experimental",
+      "case": {
+        "implementation_id": "experimental.h100.d17_dx",
+        "fixture_id": "production_borey",
+        "workspace_mib": 256,
+        "direction": "d17_dx",
+        "dw_groups": null,
+        "hardware": "h100_pcie_sm90",
+        "explicit_kernel_config_required": true,
+        "expected_rtx4060": "NOT_APPLICABLE"
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "workspace_mib": [
+          256,
+          512
+        ]
+      }
+    },
+    {
+      "id": "h100-d35_dw",
+      "tier": "h100_experimental",
+      "case": {
+        "implementation_id": "experimental.h100.d35_dw",
+        "fixture_id": "production_borey",
+        "workspace_mib": 256,
+        "direction": "d35_dw",
+        "dw_groups": null,
+        "hardware": "h100_pcie_sm90",
+        "explicit_kernel_config_required": true,
+        "expected_rtx4060": "NOT_APPLICABLE"
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "workspace_mib": [
+          256,
+          512
+        ]
+      }
+    },
+    {
+      "id": "h100-d35_dw-g2",
+      "tier": "h100_experimental",
+      "case": {
+        "implementation_id": "experimental.h100.d35_dw.group2",
+        "fixture_id": "production_borey",
+        "workspace_mib": 256,
+        "direction": "d35_dw",
+        "dw_groups": 2,
+        "hardware": "h100_pcie_sm90",
+        "explicit_kernel_config_required": true,
+        "expected_rtx4060": "NOT_APPLICABLE"
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "workspace_mib": [
+          256,
+          512
+        ]
+      }
+    },
+    {
+      "id": "h100-d35_dw-g4",
+      "tier": "h100_experimental",
+      "case": {
+        "implementation_id": "experimental.h100.d35_dw.group4",
+        "fixture_id": "production_borey",
+        "workspace_mib": 256,
+        "direction": "d35_dw",
+        "dw_groups": 4,
+        "hardware": "h100_pcie_sm90",
+        "explicit_kernel_config_required": true,
+        "expected_rtx4060": "NOT_APPLICABLE"
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "workspace_mib": [
+          256,
+          512
+        ]
+      }
+    },
+    {
+      "id": "h100-d17_dx_d35_dw",
+      "tier": "h100_experimental",
+      "case": {
+        "implementation_id": "experimental.h100.d17_dx_d35_dw",
+        "fixture_id": "production_borey",
+        "workspace_mib": 256,
+        "direction": "d17_dx_d35_dw",
+        "dw_groups": null,
+        "hardware": "h100_pcie_sm90",
+        "explicit_kernel_config_required": true,
+        "expected_rtx4060": "NOT_APPLICABLE"
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "workspace_mib": [
+          256,
+          512
+        ]
+      }
+    },
+    {
+      "id": "h100-d17_dx_d35_dw-g2",
+      "tier": "h100_experimental",
+      "case": {
+        "implementation_id": "experimental.h100.d17_dx_d35_dw.group2",
+        "fixture_id": "production_borey",
+        "workspace_mib": 256,
+        "direction": "d17_dx_d35_dw",
+        "dw_groups": 2,
+        "hardware": "h100_pcie_sm90",
+        "explicit_kernel_config_required": true,
+        "expected_rtx4060": "NOT_APPLICABLE"
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "workspace_mib": [
+          256,
+          512
+        ]
+      }
+    },
+    {
+      "id": "h100-d17_dx_d35_dw-g4",
+      "tier": "h100_experimental",
+      "case": {
+        "implementation_id": "experimental.h100.d17_dx_d35_dw.group4",
+        "fixture_id": "production_borey",
+        "workspace_mib": 256,
+        "direction": "d17_dx_d35_dw",
+        "dw_groups": 4,
+        "hardware": "h100_pcie_sm90",
+        "explicit_kernel_config_required": true,
+        "expected_rtx4060": "NOT_APPLICABLE"
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ],
+        "workspace_mib": [
+          256,
+          512
+        ]
+      }
+    },
+    {
+      "id": "full-model-common",
+      "tier": "full_model",
+      "case": {
+        "implementation_id": "model.unet.parity",
+        "fixture_id": "full_unet_small",
+        "include_self": true,
+        "in_multiplicities": [
+          3,
+          1
+        ],
+        "out_multiplicities": [
+          1,
+          1
+        ],
+        "operations": [
+          "forward",
+          "grad_input",
+          "grad_parameters",
+          "batchnorm_state",
+          "optimizer_step"
+        ]
+      },
+      "axes": {
+        "backend": [
+          "torch",
+          "triton"
+        ],
+        "regular_r1_variant": [
+          "fused",
+          "semi_packed"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "degree-buckets",
+      "tier": "boundary",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1"
+      },
+      "axes": {
+        "fixture_id": [
+          "degree_7",
+          "degree_8",
+          "degree_9",
+          "degree_15",
+          "degree_16",
+          "degree_17",
+          "degree_31",
+          "degree_32",
+          "degree_33"
+        ],
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "large-r1-1056",
+      "tier": "large",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "fixture_id": "ring_small",
+        "in_multiplicities": [
+          1056,
+          1056,
+          1056
+        ],
+        "out_multiplicities": [
+          3,
+          3,
+          3
+        ]
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "large-r2-512",
+      "tier": "large",
+      "case": {
+        "implementation_id": "triton.regular.fused.multi_radial",
+        "num_radial": 2,
+        "fixture_id": "ring_small",
+        "in_multiplicities": [
+          512,
+          512,
+          512
+        ],
+        "out_multiplicities": [
+          3,
+          3,
+          3
+        ]
+      },
+      "axes": {
+        "execution": [
+          "eager",
+          "compiled_fullgraph"
+        ]
+      }
+    },
+    {
+      "id": "multiplicity-rejected",
+      "tier": "contract",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "fixture_id": "ring_small",
+        "in_multiplicities": [
+          1057,
+          1057,
+          1057
+        ],
+        "out_multiplicities": [
+          1,
+          1,
+          1
+        ],
+        "expected_outcome": "EXPECTED_ERROR",
+        "expected_error_contains": "maximum supported R1 multiplicity",
+        "operations": [
+          "dispatch"
+        ]
+      },
+      "axes": {}
+    },
+    {
+      "id": "order-rejected",
+      "tier": "contract",
+      "case": {
+        "implementation_id": "triton.regular.fused.r1",
+        "fixture_id": "ring_small",
+        "in_multiplicities": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "out_multiplicities": [
+          1
+        ],
+        "expected_outcome": "EXPECTED_ERROR",
+        "expected_error_contains": "maximum supported irrep order",
+        "operations": [
+          "dispatch"
+        ]
+      },
+      "axes": {}
+    },
+    {
+      "id": "radial-rejected",
+      "tier": "contract",
+      "case": {
+        "implementation_id": "triton.regular.fused.multi_radial",
+        "num_radial": 5,
+        "fixture_id": "ring_small",
+        "expected_outcome": "EXPECTED_ERROR",
+        "expected_error_contains": "maximum supported radial count",
+        "operations": [
+          "dispatch"
+        ]
+      },
+      "axes": {}
+    },
+    {
+      "id": "semi-low-precision-rejected",
+      "tier": "contract",
+      "case": {
+        "implementation_id": "triton.regular.semi_packed.r1",
+        "regular_r1_variant": "semi_packed",
+        "expected_outcome": "EXPECTED_ERROR",
+        "expected_error_contains": "supports FP32",
+        "operations": [
+          "dispatch"
+        ]
+      },
+      "axes": {
+        "dtype": [
+          "float16",
+          "bfloat16"
+        ]
+      }
+    }
+  ],
+  "registered_config_policy": {
+    "source": "build_registry().registered_configs",
+    "required": "Force every registered configuration on its admitted architecture/family using representative odd-tail fixture; record exact config_id and actual kernel. No autotune-selected-only certification.",
+    "architectures": {
+      "rtx4060": 8,
+      "h100": 9,
+      "sm7": "NOT_APPLICABLE on available devices; retain registrations"
+    },
+    "unresolved": "Restore explicitly or leave NOT_RUN with source descriptor; never count as passed."
+  },
+  "production_shape_policy": {
+    "source_contract": "benchmarks/h100_production_contract_v2.json",
+    "historical_legacy_shapes": "benchmarks/regular_r1_matrix.json",
+    "require_current_captures": true,
+    "legacy_scope": "Diagnostic fixture; not the current production model.",
+    "oom": "Record resource limitation; never silently substitute smaller original shape."
+  }
+}

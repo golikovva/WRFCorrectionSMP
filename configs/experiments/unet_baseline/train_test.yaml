@@ -1,0 +1,225 @@
+data:
+  nestp_folder: '/home/wrf_nestp/'
+  borey_folder: '/home/wrf_borey/'
+  era_folder: '/home/era_data/'
+  gfs_folder: '/home/gfs_data/'
+  scatter_folder: '/home/scatter/'
+  stations_folder: '/home/stations/'
+  wrf_mean_path: "/home/metadata/means_dict"
+  wrf_std_path: "/home/metadata/stds_dict"
+  base_folder: '/home'
+  logs_folder: "/home/logs/"
+  wrf_variables: ['uvmet10', 'T2', 'SEAICE', 'HGT']
+  era_variables: ['u10', 'v10', 't2m']
+  gfs_variables: ['UGRD_10maboveground', 'VGRD_10maboveground', 'TMP_2maboveground']
+
+global_seed: 137
+
+stations_ds:
+  wind_variables: ['WSPD10']
+  wind_format: 'w'
+
+split_config:
+  start_date: '2015-01-01'
+  end_date: '2023-12-31'
+  split_mode: 'years'
+  train_size: 0.45
+  validation_size: 0.05
+  test_size: 0.5
+  time_step: '1h'
+  train_end: ~
+  validation_end: ~
+  valid_years: '2019'
+  test_years: '2020'
+  blocks_per_season: 1
+  block_size: '7D'
+  seed: 42
+  validation_blocks_per_season: 1
+  validation_block_size: '14D'
+  validation_seed: 42
+  require_complete_blocks: true
+
+reference_dataset: WRF
+target_dataset: ERA5
+reference_region: borey
+
+s2s:
+  sequence_len: 4
+
+train:
+  max_epochs: 15
+  scheduler_type: MultiStepLR
+  lr: 0.0001
+
+compile_model: True
+pretrained_weights: ~
+model_input:
+  drop_first_channels: 0
+model_type: UNet
+model_args:
+  UNet:
+    n_channels: 7
+    n_classes: 3
+    bilinear: True
+    hidden_channels: [64, 128, 256, 512, 1024]
+  BERTunet:
+    n_channels: 9
+    n_classes: 3
+    bilinear: True
+    h: 210  # 412
+    w: 280  # 1050
+    chan_factor: 1
+  DETrajGRU:
+    encoder_cahnnels: 2
+  VSBERTunet:
+    n_channels: 4
+    n_classes: 3
+    max_len: 24
+    chan_factor: 2
+    bilinear: True
+  ConvNext:
+    n_channels: 9
+    n_classes: 3
+  RoPEUNet:
+    n_channels: 7
+    n_classes: 3
+    bilinear: True
+    chan_factor: 1
+    batch_first: False
+    max_T: 10
+    vit_depth: 4
+    vit_heads: 4
+    vit_mlp_ratio: 4.0
+    vit_drop: 0.0
+    vit_attn_drop: 0.0
+    vit_drop_path: 0.0
+    vit_rope_theta: 10000.0
+    vit_rope_mode: "mixed"
+  RoPEConvNeXtV2:
+    in_chans: 9
+    out_channel: 3
+    depths: [3, 3, 9, 3]
+    dims: [64, 128, 256, 512]
+    drop_path_rate: 0.0
+    head_init_scale: 1.0
+    batch_first: False
+    max_T: 10
+    vit_depth: 4
+    vit_heads: 4
+    vit_mlp_ratio: 4.0
+    vit_drop: 0.0
+    vit_attn_drop: 0.0
+    vit_drop_path: 0.0
+    vit_rope_theta: 100.0
+    vit_rope_mode: "mixed"
+  IrrepSphereUNet:
+    input_schema:
+      scalars:
+        T2: 2
+        SEAICE: 3
+        HGT: 4
+        HoD: 5
+        DoY: 6
+      vectors:
+        uvmet10: [0, 1]
+
+    output_schema:
+      scalars:
+        T2: 2
+      vectors:
+        uvmet10: [0, 1]
+
+    model:
+      num_radial: 1
+      multiplicities: [32, 64, 128, 256]
+      regular_samples: ~ 
+      normalize_by_neighbors: True
+      include_self: True
+      self_identity_init: False
+      quadrature: False
+      quadrature_radial: 1
+      quadrature_angular: 8
+      quadrature_sigma_km: ~
+      irrep_conv_backend: "triton"
+      regular_r1_variant: "semi_packed"
+
+    graph:
+      levels: 4
+      radius_km: 9
+      frame_strategy: east_north
+
+location_encoding:
+  enabled: False
+  type: siren_sh
+  legendre_polys: 40
+  out_channels: 4
+  dim_hidden: 64
+  num_layers: 2
+  dropout: false
+  w0: 1.0
+  w0_initial: 30.0
+
+betas:
+  beta_era: 1
+  beta_ms: 10
+  beta_st: 1
+  beta_sc: 1
+
+run_config:
+  run_mode: 'train'
+  num_workers: 8
+  batch_size: 8
+  use_spatial_encoding: 0
+  use_time_encoding: 1
+  use_landmask: 0
+  weighted_meaner: 1
+  save_mapping: False
+  variable_sequence_length: 0
+  use_stations: False
+  use_scatter: False
+
+loss_config:
+  loss_kernel: 'gauss'
+  k: 9
+  era_loss: lat_weighted_mse
+  scatter_loss: lat_weighted_mse
+
+test_config:
+  debug_mode: False
+  profiling:
+    enabled: False
+    log_every: 10
+    warmup_batches: 1
+    top_k: 12
+    sync_cuda: True
+    console_output: False
+    slow_batch_seconds: 60
+    stack_dump_seconds: 0
+    output_file: test_profile.jsonl
+  best_epoch_id: 6
+  run_id: 2
+  draw_plots: 1
+  plot_samples: False
+  draw_spectrum: 0
+  save_losses: 0
+  save_outputs: 0
+  use_stations: True
+  regional_metrics:
+    enabled: true
+    temporal_resolution: 'M'
+    region_sources:
+      borey:
+        type: shapefile
+        path: /home/metadata/borey_domain.shp
+      nestp:
+        type: shapefile
+        path: /home/metadata/nestp_domain.shp
+
+    masks:
+      - name: borey_inside_eval
+        op: region
+        region: borey
+      - name: eval_without_borey
+        op: difference
+        base: nestp
+        subtract: borey

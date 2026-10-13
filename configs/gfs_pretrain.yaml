@@ -156,6 +156,8 @@ run_config:
 loss_config:
   loss_kernel: 'gauss'
   k: 9
+  era_loss: mse
+  scatter_loss: mse
 
 test_config:
   debug_mode: False

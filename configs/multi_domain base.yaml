@@ -1,0 +1,56 @@
+experiment_name: zero_shot_borey_to_nestp
+
+base_config_path: '/home/configs/train_test.yaml'
+stages:
+  - name: pretrain_borey
+    init_weights_from: none
+    overrides:
+      reference_region: borey
+      reference_dataset: WRF
+      target_dataset: ERA5
+      pretrained_weights: ~
+      split_config:
+        start_date: '2015-01-15'
+        end_date: '2023-12-31'
+        split_mode: 'years'
+        valid_years: '2019'
+        test_years: '2020'
+      run_config:
+        run_mode: train
+        batch_size: 12
+
+  - name: test_nestp_zeroshot
+    init_weights_from: previous
+    overrides:
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: 'percents'
+        train_size: 0.45
+        validation_size: 0.05
+        test_size: 0.5
+        time_step: '1h'
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: test
+        batch_size: 1
+
+  - name: finetune_nestp
+    init_weights_from: previous
+    overrides:
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: 'percents'
+        train_size: 0.45
+        validation_size: 0.05
+        test_size: 0.5
+        time_step: '1h'
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 1

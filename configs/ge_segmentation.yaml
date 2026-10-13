@@ -1,0 +1,44 @@
+# One run. Repeat with seeds 137, 138, 139 for a multi-seed comparison.
+seed: 137
+data:
+  root: data/mnist
+  download: false
+  scenes:
+    train: 55000
+    val: 1000
+    test: 1000
+  chart_half_width: 1.5707963267948966
+  threshold: 0.5
+geometry:
+  fine_level: 4
+  radius_factor: 1.05
+  earth_radius_km: 6371.0
+model:
+  multiplicities: [8, 16, 32, 64]
+  max_order: 2
+  regular_samples: 16
+  num_radial: 3
+  normalize_by_neighbors: true
+  include_self: true
+  quadrature: false
+  irrep_conv_backend: auto
+train:
+  batch_size: 8
+  max_epochs: 50
+  lr: 0.001
+  weight_decay: 0.0001
+  patience: 10
+  background_weight: 0.1
+  train_rotation: none  # none | random_so3
+evaluation:
+  N_each: 1
+  val_rotations: 32
+  test_rotations: 64
+  diagnostic_scenes: 128
+  panel_scenes: 4
+runtime:
+  device: auto
+  workers: 4
+  threads: 4
+output:
+  root: results/ge_segmentation

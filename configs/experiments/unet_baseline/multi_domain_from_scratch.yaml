@@ -1,0 +1,222 @@
+experiment_name: unet_train_size_dependence_lwmse_from_scratch
+
+base_config_path: '/home/configs/experiments/unet_baseline/train_test.yaml'
+
+stages:
+  - name: train_nestp_from_scratch_1wps
+    init_weights_from: none
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 1
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_scratch_2wps
+    init_weights_from: none
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 2
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_scratch_3wps
+    init_weights_from: none
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 3
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_scratch_4wps
+    init_weights_from: none
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 4
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_scratch_5wps
+    init_weights_from: none
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 5
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_scratch_7wps
+    init_weights_from: none
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 7
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_scratch_9wps
+    init_weights_from: none
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 9
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+
+  - name: train_nestp_from_scratch_allwps
+    init_weights_from: none
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 'all'
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true

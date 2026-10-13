@@ -1,6 +1,5 @@
-experiment_name: zero_shot_borey_to_nestp
-
-base_config_path: '/home/configs/train_test.yaml'
+experiment_name: noenc_from_pretrained_nestp_train_size_dependence_lwmse
+base_config_path: /home/configs/train_test.yaml
 stages:
   - name: pretrain_borey
     init_weights_from: none
@@ -11,16 +10,15 @@ stages:
       pretrained_weights: ~
       split_config:
         start_date: '2015-01-15'
-        end_date: '2023-12-31'
+        end_date: '2020-12-31'
         split_mode: 'years'
         valid_years: '2019'
         test_years: '2020'
       run_config:
         run_mode: train
-        batch_size: 12
-
+        batch_size: 14
   - name: test_nestp_zeroshot
-    init_weights_from: previous
+    init_weights_from: pretrain_borey
     overrides:
       split_config:
         start_date: '2019-01-01'
@@ -35,22 +33,194 @@ stages:
       target_dataset: ERA5
       run_config:
         run_mode: test
-        batch_size: 1
-
-  - name: finetune_nestp
-    init_weights_from: previous
+        batch_size: 2
+  - name: train_nestp_from_pretrained_1wps
+    init_weights_from: pretrain_borey
     overrides:
+      global_seed: 137
       split_config:
         start_date: '2019-01-01'
         end_date: '2020-12-31'
-        split_mode: 'percents'
-        train_size: 0.45
-        validation_size: 0.05
-        test_size: 0.5
-        time_step: '1h'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 1
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
       reference_region: nestp
       reference_dataset: WRF
       target_dataset: ERA5
       run_config:
         run_mode: train
-        batch_size: 1
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_pretrained_2wps
+    init_weights_from: pretrain_borey
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 2
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_pretrained_3wps
+    init_weights_from: pretrain_borey
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 3
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_pretrained_4wps
+    init_weights_from: pretrain_borey
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 4
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_pretrained_5wps
+    init_weights_from: pretrain_borey
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 5
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_pretrained_7wps
+    init_weights_from: pretrain_borey
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 7
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+  - name: train_nestp_from_pretrained_9wps
+    init_weights_from: pretrain_borey
+    overrides:
+      global_seed: 137
+      split_config:
+        start_date: '2019-01-01'
+        end_date: '2020-12-31'
+        split_mode: seasonal_nested
+        test_years: '2020'
+        blocks_per_season: 9
+        block_size: '7D'
+        seed: 42
+        validation_blocks_per_season: 1
+        validation_block_size: '14D'
+        validation_seed: 42
+        require_complete_blocks: true
+      reference_region: nestp
+      reference_dataset: WRF
+      target_dataset: ERA5
+      run_config:
+        run_mode: train
+        batch_size: 2
+      test_config:
+        regional_metrics:
+          enabled: true
+        profiling:
+          enabled: true
+

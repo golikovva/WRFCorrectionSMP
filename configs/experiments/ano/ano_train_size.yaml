@@ -1,0 +1,64 @@
+# Independent seasonal ANO learning-curve experiment (no shared training config).
+data:
+  nestp_folder: /home/wrf_nestp/
+  era_folder: /home/era_data/
+  era_wind_subdir: uv10m
+  logs_folder: /home/logs/
+  wrf_variables: [uvmet10, T2]
+  era_variables: [u10, v10, t2m]
+
+global_seed: 42
+device: cpu
+weeks_per_season: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+reference_dataset: WRF
+target_dataset: ERA5
+reference_region: nestp
+
+ano:
+  time_mean_period: season
+  season_months: [[12, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]]
+
+split_config:
+  start_date: '2019-01-01'
+  end_date: '2020-12-31'  # Exclusive: the 2020-12-31 day is outside the experiment.
+  split_mode: seasonal_nested
+  time_step: 1h
+  test_years: '2020'
+  blocks_per_season: 1  # Replaced independently for every requested training size.
+  block_size: 7D
+  seed: 42
+  validation_blocks_per_season: 1
+  validation_block_size: 14D
+  validation_seed: 42
+  require_complete_blocks: true
+
+s2s:
+  sequence_len: 4
+
+run_config:
+  run_mode: test
+  num_workers: 8
+  batch_size: 4
+  use_spatial_encoding: false
+  use_time_encoding: false
+  use_landmask: false
+  weighted_meaner: true
+  save_mapping: false
+  variable_sequence_length: false
+  use_stations: false
+  use_scatter: false
+
+test_config:
+  debug_mode: false
+  run_id: 0
+  plot_samples: false
+  draw_plots: false
+  draw_spectrum: false
+  save_losses: false
+  save_outputs: false
+  use_stations: false
+  profiling:
+    enabled: false
+  regional_metrics:
+    enabled: false
